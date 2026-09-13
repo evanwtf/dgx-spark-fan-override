@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+module=nvfanread
+version=1.0.0
+
+case "${1:-}" in
+	remove|upgrade|deconfigure)
+		if grep -q "^${module} " /proc/modules 2>/dev/null; then
+			rmmod "$module" || true
+		fi
+		if [ -e "/var/lib/dkms/$module/$version" ]; then
+			dkms remove -m "$module" -v "$version" --all 2>/dev/null || true
+		fi
+		;;
+esac
+
+exit 0

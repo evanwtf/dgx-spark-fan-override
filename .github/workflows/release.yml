@@ -28,7 +28,9 @@ jobs:
       # Gate 2 + build: each package's control Version must equal the tag
       # (leading "v" stripped), or the build fails.
       - name: Build packages
-        run: sh scripts/build-debs.sh "${GITHUB_REF_NAME#v}"
+        run: |
+          sh scripts/build-debs.sh "${GITHUB_REF_NAME#v}"
+          sh scripts/build-nvfanread-deb.sh "${GITHUB_REF_NAME#v}"
 
       - name: Publish release
         env:

@@ -1,0 +1,32 @@
+name: package
+
+# Build the .deb packages on every push/PR and upload them as downloadable
+# artifacts. These are DKMS source packages — the kernel module is compiled on
+# the target at install time — so they build on x86_64 runners with no arm64
+# cross-compile.
+on:
+  push:
+  pull_request:
+
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .deb packages
+        run: |
+          sh scripts/build-debs.sh              # nvfancontrol (static tree)
+          sh scripts/build-nvfanread-deb.sh     # nvfanread (DKMS, assembled)
+          ls -l dist/
+          for d in dist/*.deb; do
+            echo "== $d =="
+            dpkg-deb -I "$d" | sed -n '1,12p'
+          done
+
+      - name: Upload .deb artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs
+          path: dist/*.deb
+          if-no-files-found: error

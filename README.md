@@ -11,8 +11,24 @@ provides two independent kernel modules:
 
 Both bind the same verified FF-A partition (`arm-ffa-17`) but only one can be
 bound at a time. `nvfanread` is the read-only tool — see
-[`nvfanread/README.md`](nvfanread/README.md) and the tracking issue for the
-hwmon work. Everything below documents the shared EC/FF-A protocol.
+[`nvfanread/README.md`](nvfanread/README.md). Everything below documents the
+shared EC/FF-A protocol.
+
+### Motivation: fan RPM in Prometheus
+
+`nvfanread` exists to get DGX Spark **fan speed into Prometheus via
+node_exporter**. The Spark exposes no fan RPM to the OS out of the box
+(`sensors` shows only temperatures), so there's nothing for monitoring to
+scrape. `nvfanread` reads the EC's fan tachometer telemetry and presents it as a
+standard **hwmon** device, which node_exporter's `hwmon` collector picks up
+automatically — no exporter config needed:
+
+```
+node_hwmon_fan_rpm{chip="devices_arm_ffa_17",sensor="fan1"} 2700
+node_hwmon_fan_rpm{chip="devices_arm_ffa_17",sensor="fan2"} 4050
+```
+
+That works today. `sensors` shows the same via `nvfanread-virtual-0`.
 
 > **Unofficial and firmware-specific.** This is reverse-engineered, not an NVIDIA
 > interface. The addresses and command numbers below were observed on EC firmware
