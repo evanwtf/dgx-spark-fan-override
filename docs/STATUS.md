@@ -31,15 +31,22 @@ nothing special).
    EC standby rail.
 3. Reconnect power, boot.
 
-**Then retest (standalone — the signed module + enrolled MOK persist across the
-power cycle):**
+**Then retest (standalone — the enrolled MOK persists, but the `.ko` is not
+checked in, so rebuild + re-sign it first; Secure Boot requires the signature):**
 ```sh
-sudo insmod ~/git/dgx-spark-fan-override/nvfanread/nvfanread.ko
+cd ~/git/dgx-spark-fan-override/nvfanread
+make
+SIGN="/lib/modules/$(uname -r)/build/scripts/sign-file"
+"$SIGN" sha256 ~/.mok/nvfanread-mok.priv ~/.mok/nvfanread-mok.der nvfanread.ko
+sudo insmod nvfanread.ko
 cat /sys/bus/arm_ffa/devices/arm-ffa-17/telemetry   # success = 64-byte snapshot + RPM candidates
 sudo rmmod nvfanread
 ```
-- **Snapshot returned** → EC is back; wire up the decode below and finish #3/#4/#5.
-- **Still `Input/output error`** → EC didn't reset; deeper/unit-specific issue (see #10).
+- **Snapshot returned → the EC is back.** For the full hwmon/`sensors` output,
+  the decode + hwmon driver is in **PR #11** (branch `fan-rpm-decode`, CI-green,
+  mergeable): `git checkout fan-rpm-decode`, rebuild+sign+load the same way, then
+  `sensors` — `fan1_input`/`fan2_input` should show RPM. Then merge #11.
+- **Still `Input/output error`** → EC didn't reset; deeper/unit-specific issue (#10).
 
 **Decode (already solved, from the fork):** in the command-7 reply,
 `fan0_rpm = le16(reply[7])`, `fan1_rpm = le16(reply[9])` → in nvfanread's 64-byte
