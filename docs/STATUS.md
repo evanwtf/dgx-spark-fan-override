@@ -10,29 +10,45 @@ via a **read-only** hwmon driver that reads the EC's fan telemetry over FF-A.
 The box's tachometers are EC-owned; nothing in the OS exposes fan RPM today
 (`sensors` shows temps only). Tracking issue: **#7**.
 
-## ⛔ Immediate blocker + next action — READY TO ENROLL
-Loading is blocked by **Secure Boot** (`Key was rejected by service`); the module
-is signed with our MOK. **Current state (2026-09-13, pre-reboot):**
-- ✅ **MOK staged** — `sudo mokutil --import ~/.mok/nvfanread-mok.der` was run and
-  a one-time password set. `mokutil --list-new` confirms `[key 1]`, Serial
-  `4f:9e:7d:…:d8:16`, `CN=nvfanread module signing (evan MOK)` — matches our key.
-- ✅ **HDMI monitor + USB-C keyboard connected.**
-- ⏳ **Reboot pending.** This reboot WILL trigger MokManager and enroll the key.
+## ⛔ Current blocker + next action — EC MAILBOX TIMES OUT (cold-reset the EC)
+Secure Boot is **solved**: MOK enrolled ✅, signed module loads ✅. But the EC
+telemetry read **times out** — every command through the OEM1-cmd-17 mailbox
+returns service **status 5** (~54 ms controller timeout); the EC isn't answering
+the doorbell. Full analysis in **#10**.
 
-**At the reboot — MokManager (blue screen):** press a key within ~10 s →
-**Enroll MOK → View key 0** (verify `CN=nvfanread module signing`) **→ Continue →
-Yes →** type the password set at import **→ Reboot**. One-time; the box is headless
-again afterwards.
+**Root cause (high confidence): the EC is latched in a bad state** after today's 3
+power-button OOM force-offs. A warm reboot does NOT reset the EC (it stays on
+standby power — confirmed: our post-enrollment reboot didn't clear it). Our code
+is **correct** — byte-identical to the `mathieu-lacage/dgx-spark-fan-override`
+fork, which reads *real* RPM on a healthy Spark with the same mechanism. Ruled
+out: cache mapping (WB/WT/WC all identical), firmware drift (EC `0x03000508`
+matches the doc), command framing, and OS contention (the working fork does
+nothing special).
 
-**After boot (over `ssh dgx`, e.g. from the Mac):**
+**Next action — cold-reset the EC (needs physical access to the box):**
+1. `sudo poweroff`
+2. **Unplug the power cable** (and any USB-C power); wait **~5 min** to drain the
+   EC standby rail.
+3. Reconnect power, boot.
+
+**Then retest (standalone — the signed module + enrolled MOK persist across the
+power cycle):**
 ```sh
-mokutil --list-enrolled | grep -i nvfanread            # the key should now appear
 sudo insmod ~/git/dgx-spark-fan-override/nvfanread/nvfanread.ko
-cat /sys/bus/arm_ffa/devices/arm-ffa-17/telemetry        # capture the 64-byte snapshot -> issue #1
+cat /sys/bus/arm_ffa/devices/arm-ffa-17/telemetry   # success = 64-byte snapshot + RPM candidates
 sudo rmmod nvfanread
 ```
-If MokManager doesn't appear or enrollment fails, re-stage with `mokutil --import`
-and reboot again (harmless). Full runbook: [`secure-boot-signing.md`](secure-boot-signing.md).
+- **Snapshot returned** → EC is back; wire up the decode below and finish #3/#4/#5.
+- **Still `Input/output error`** → EC didn't reset; deeper/unit-specific issue (see #10).
+
+**Decode (already solved, from the fork):** in the command-7 reply,
+`fan0_rpm = le16(reply[7])`, `fan1_rpm = le16(reply[9])` → in nvfanread's 64-byte
+snapshot that's bytes `[4..5]` and `[6..7]`. Reference:
+`mathieu-lacage/dgx-spark-fan-override` (GPL, same upstream) implements
+`fan_caps`/`fan_telemetry`/`fan_rpm` read attributes — a good model for #3/#4.
+
+Diagnostic harness used to reach this: **`tools/ec-probe/`** (parametrized probe;
+sweep EC command / lengths / cache mode; build+sign+load via `run.sh`).
 
 ## What's done
 - **Read-only `nvfanread` module** (the *decoder*): binds `arm-ffa-17`, issues only
@@ -45,12 +61,18 @@ and reboot again (harmless). Full runbook: [`secure-boot-signing.md`](secure-boo
   - tag-triggered release workflow builds the DKMS `.deb` with a version gate
     (fixed a real bug: maintainer scripts were non-executable).
   - README rewritten in English (dropped the zh/en split).
-- **MOK signing prepped:** key at `~/.mok/` on the DGX (`nvfanread-mok.priv` 600,
+- **MOK generated, signed, and ENROLLED** (Secure Boot solved; module loads and
+  binds — dmesg "read-only telemetry ready"): key at `~/.mok/` on the DGX (`nvfanread-mok.priv` 600,
   `nvfanread-mok.der`), module signed (`signer: nvfanread module signing (evan MOK)`,
   sha256). Backed up in **1Password → Code Secrets → "nvfanread MOK — DGX Spark
   module signing"** (item `ogbrdqzcbfqsypinogximv3hmq`). Fingerprint
   `4F:9E:7D:1D:9A:77:56:56:9E:CE:05:DA:EC:7E:3E:76:BD:B1:D8:16`. **Never commit
   the private key** (`.gitignore` blocks key material).
+
+- **EC mailbox diagnosed (#10):** every OEM1-cmd-17 command times out (status 5,
+  ~54ms); confirmed our code is correct vs the working `mathieu-lacage` fork; the
+  RPM decode is known (reply offsets 7 and 9). Root cause = EC latched → needs the
+  cold reset above. Diagnostic harness preserved in `tools/ec-probe/`.
 
 ## Task chain (issues)
 `#1 decode RPM offsets` → `#2 extract fn + tests` → `#3 hwmon driver (fanN_input)`
