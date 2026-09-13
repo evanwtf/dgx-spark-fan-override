@@ -27,6 +27,7 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/errno.h>
+#include <linux/hwmon.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
@@ -53,9 +54,18 @@
 #define REPLY_POLL_MS              10U
 #define ESPI_TIMEOUT_FLOOR_US      40000LL
 
+/*
+ * Reuse a telemetry snapshot this fresh so reading fan1 then fan2 (as sensors
+ * and node_exporter do) costs one EC transaction, not two.
+ */
+#define NVFANREAD_CACHE_MS         200U
+
 struct nvfanread_state {
 	struct ffa_device *fdev;
 	struct mutex request_lock;
+	u8 cache[NVFR_TELEMETRY_LEN];
+	ktime_t cache_time;
+	bool cache_valid;
 };
 
 static void restore_shared_page(struct device *dev, u8 *shm,
@@ -199,6 +209,38 @@ out_unmap:
 	return ret;
 }
 
+/*
+ * Return a telemetry snapshot, serialized and lightly cached: a fresh cached
+ * copy (< NVFANREAD_CACHE_MS old) is reused; otherwise one EC read is issued and
+ * cached. All callers go through here so requests are serialized.
+ */
+static int nvfanread_get_snapshot(struct nvfanread_state *state,
+				  u8 snap[NVFR_TELEMETRY_LEN])
+{
+	int ret;
+
+	ret = mutex_lock_interruptible(&state->request_lock);
+	if (ret)
+		return ret;
+
+	if (state->cache_valid &&
+	    ktime_before(ktime_get(),
+			 ktime_add_ms(state->cache_time, NVFANREAD_CACHE_MS))) {
+		memcpy(snap, state->cache, NVFR_TELEMETRY_LEN);
+		mutex_unlock(&state->request_lock);
+		return 0;
+	}
+
+	ret = read_telemetry(state, snap);
+	if (!ret) {
+		memcpy(state->cache, snap, NVFR_TELEMETRY_LEN);
+		state->cache_time = ktime_get();
+		state->cache_valid = true;
+	}
+	mutex_unlock(&state->request_lock);
+	return ret;
+}
+
 static ssize_t telemetry_show(struct device *dev, struct device_attribute *attr,
 			      char *buf)
 {
@@ -208,11 +250,7 @@ static ssize_t telemetry_show(struct device *dev, struct device_attribute *attr,
 	unsigned int i;
 	int ret;
 
-	ret = mutex_lock_interruptible(&state->request_lock);
-	if (ret)
-		return ret;
-	ret = read_telemetry(state, snap);
-	mutex_unlock(&state->request_lock);
+	ret = nvfanread_get_snapshot(state, snap);
 	if (ret)
 		return ret;
 
@@ -253,9 +291,75 @@ static ssize_t telemetry_show(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_RO(telemetry);
 
+/* ---- hwmon: fan1_input / fan2_input in RPM (channels 0 and 1) ---- */
+
+static const char * const nvfanread_fan_labels[] = { "fan0", "fan1" };
+
+static umode_t nvfanread_hwmon_is_visible(const void *drvdata,
+					  enum hwmon_sensor_types type,
+					  u32 attr, int channel)
+{
+	if (type == hwmon_fan &&
+	    (attr == hwmon_fan_input || attr == hwmon_fan_label))
+		return 0444;
+	return 0;
+}
+
+static int nvfanread_hwmon_read(struct device *dev,
+				enum hwmon_sensor_types type, u32 attr,
+				int channel, long *val)
+{
+	struct nvfanread_state *state = dev_get_drvdata(dev);
+	u8 snap[NVFR_TELEMETRY_LEN];
+	u16 fan0_rpm, fan1_rpm;
+	int ret;
+
+	if (type != hwmon_fan || attr != hwmon_fan_input)
+		return -EOPNOTSUPP;
+
+	ret = nvfanread_get_snapshot(state, snap);
+	if (ret)
+		return ret;
+
+	nvfr_snapshot_fan_rpm(snap, &fan0_rpm, &fan1_rpm);
+	*val = (channel == 0) ? fan0_rpm : fan1_rpm;
+	return 0;
+}
+
+static int nvfanread_hwmon_read_string(struct device *dev,
+				       enum hwmon_sensor_types type, u32 attr,
+				       int channel, const char **str)
+{
+	if (type != hwmon_fan || attr != hwmon_fan_label ||
+	    channel >= (int)ARRAY_SIZE(nvfanread_fan_labels))
+		return -EOPNOTSUPP;
+
+	*str = nvfanread_fan_labels[channel];
+	return 0;
+}
+
+static const struct hwmon_ops nvfanread_hwmon_ops = {
+	.is_visible = nvfanread_hwmon_is_visible,
+	.read = nvfanread_hwmon_read,
+	.read_string = nvfanread_hwmon_read_string,
+};
+
+static const struct hwmon_channel_info * const nvfanread_hwmon_info[] = {
+	HWMON_CHANNEL_INFO(fan,
+			   HWMON_F_INPUT | HWMON_F_LABEL,
+			   HWMON_F_INPUT | HWMON_F_LABEL),
+	NULL,
+};
+
+static const struct hwmon_chip_info nvfanread_hwmon_chip = {
+	.ops = &nvfanread_hwmon_ops,
+	.info = nvfanread_hwmon_info,
+};
+
 static int fan_read_probe(struct ffa_device *fdev)
 {
 	struct nvfanread_state *state;
+	struct device *hwmon;
 	int ret;
 
 	if (!fdev->ops || !fdev->ops->msg_ops ||
@@ -285,9 +389,17 @@ static int fan_read_probe(struct ffa_device *fdev)
 		return ret;
 	}
 
+	hwmon = devm_hwmon_device_register_with_info(&fdev->dev, "nvfanread",
+						     state, &nvfanread_hwmon_chip,
+						     NULL);
+	if (IS_ERR(hwmon)) {
+		device_remove_file(&fdev->dev, &dev_attr_telemetry);
+		return PTR_ERR(hwmon);
+	}
+
 	dev_info(&fdev->dev,
-		 "read-only telemetry ready: %s/telemetry; module load issued no EC request\n",
-		 dev_name(&fdev->dev));
+		 "read-only fan telemetry ready: hwmon '%s' (fan1_input/fan2_input) + %s/telemetry; module load issued no EC request\n",
+		 dev_name(hwmon), dev_name(&fdev->dev));
 	return 0;
 }
 

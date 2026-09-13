@@ -6,10 +6,11 @@ override driver in this repo: it binds the same FF-A partition (`arm-ffa-17`)
 but issues **only EC inner command 7** — the documented thermal/fan telemetry
 snapshot — and never touches an override slot (EC commands 3/5).
 
-The goal is to surface real fan RPM through `sensors`. This first module is the
-**decoder**: it dumps the raw 64-byte telemetry snapshot so the current-RPM
-byte offsets can be identified, after which a follow-up turns it into a proper
-hwmon driver exposing `fan1_input` / `fan2_input`.
+It surfaces real fan RPM through a **hwmon** device (`fan1_input` / `fan2_input`),
+so `sensors` and node_exporter's hwmon collector pick it up automatically. A
+`telemetry` debug attribute also dumps the raw 64-byte snapshot (hex + decoded
+RPM + candidates). A short snapshot cache means reading both fans is one EC
+transaction.
 
 ## Provenance
 
@@ -55,9 +56,14 @@ at load time on real hardware.
 
 ```sh
 sudo insmod nvfanread.ko
-cat /sys/bus/arm_ffa/devices/arm-ffa-17/telemetry
+sensors                                             # fan RPM via hwmon
+cat /sys/class/hwmon/hwmon*/fan1_input              # fan0 RPM (direct)
+cat /sys/class/hwmon/hwmon*/fan2_input              # fan1 RPM (direct)
+cat /sys/bus/arm_ffa/devices/arm-ffa-17/telemetry   # raw snapshot + decoded RPM (debug)
 sudo rmmod nvfanread
 ```
 
-The attribute prints the 64-byte snapshot as hex plus any little-endian u16 in
-the fan RPM ranges (fan0 1260–9000, fan1 1890–13500) as decode candidates.
+The module registers a hwmon device named `nvfanread` exposing `fan1_input`
+(fan0) and `fan2_input` (fan1) in RPM. The `telemetry` debug attribute dumps the
+64-byte snapshot as hex, the decoded RPM, and any little-endian u16 in the fan
+RPM ranges (fan0 1260–9000, fan1 1890–13500) as candidates.
