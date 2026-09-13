@@ -16,9 +16,13 @@ transaction.
 
 The EC/FF-A protocol (partition UUID, shared-page address, OEM1 command 17,
 the EC inner-command table, and the fan RPM ranges) was reverse-engineered by
-the upstream project this repo is forked from; see the top-level `README`. The
-mailbox handshake here is derived from that project's `nvfancontrol.c`
-(GPL-2.0), reduced to the read path only. This module is GPL-2.0.
+the upstream [Z841973620/dgx-spark-fan-override](https://github.com/Z841973620/dgx-spark-fan-override);
+the mailbox handshake here is derived from that project's `nvfancontrol.c`
+(GPL-2.0), reduced to the read path only. The live RPM **decode offsets**
+(command-7 reply bytes 7 and 9) come from the
+[mathieu-lacage/dgx-spark-fan-override](https://github.com/mathieu-lacage/dgx-spark-fan-override)
+fork, which validated them by reading real RPM on hardware. This module is
+GPL-2.0. See the top-level `README` for full credits.
 
 ## Safety
 

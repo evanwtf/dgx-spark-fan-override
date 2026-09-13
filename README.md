@@ -230,6 +230,15 @@ Service status:
 
 ## Credits
 
-The EC/FF-A protocol documented here was reverse-engineered by the upstream
-project this repository is forked from (original author `841973620`). The kernel
-modules are GPL-2.0; see [`LICENSE`](LICENSE).
+This project builds directly on prior community reverse-engineering:
+
+- **[Z841973620/dgx-spark-fan-override](https://github.com/Z841973620/dgx-spark-fan-override)**
+  — the upstream project (author `841973620`) that reverse-engineered the EC /
+  FF-A fan-control protocol documented above (partition UUID, `ns_shm0` shared
+  page, OEM1 command 17, the EC inner-command table, fan RPM ranges).
+- **[mathieu-lacage/dgx-spark-fan-override](https://github.com/mathieu-lacage/dgx-spark-fan-override)**
+  — a fork that added read-only EC telemetry and validated the live fan-RPM
+  **decode offsets** (command-7 reply bytes 7 and 9) on real hardware. The
+  `nvfanread` decode (`nvfr_snapshot_fan_rpm()`) uses exactly these offsets.
+
+The kernel modules are GPL-2.0; see [`LICENSE`](LICENSE).

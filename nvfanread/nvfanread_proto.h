@@ -145,9 +145,10 @@ static inline unsigned int nvfr_rpm_flags(nvfr_u16 v)
  * Live per-fan RPM offsets within the 64-byte command-7 telemetry snapshot.
  *
  * The EC copies 64 bytes to reply+3, so nvfanread's snapshot (which starts at
- * that copy) is reply[3..66]. The mathieu-lacage fork — validated by reading
- * real RPM on hardware — decodes fan0 at reply[7] and fan1 at reply[9], i.e.
- * snapshot bytes 4 and 6 here. Each is a little-endian u16 in RPM.
+ * that copy) is reply[3..66]. The mathieu-lacage fork
+ * (https://github.com/mathieu-lacage/dgx-spark-fan-override) — validated by
+ * reading real RPM on hardware — decodes fan0 at reply[7] and fan1 at reply[9],
+ * i.e. snapshot bytes 4 and 6 here. Each is a little-endian u16 in RPM.
  */
 #define NVFR_SNAPSHOT_FAN0_RPM_OFFSET  4U
 #define NVFR_SNAPSHOT_FAN1_RPM_OFFSET  6U

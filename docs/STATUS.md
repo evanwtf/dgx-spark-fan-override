@@ -10,43 +10,46 @@ via a **read-only** hwmon driver that reads the EC's fan telemetry over FF-A.
 The box's tachometers are EC-owned; nothing in the OS exposes fan RPM today
 (`sensors` shows temps only). Tracking issue: **#7**.
 
-## ⛔ Current blocker + next action — EC MAILBOX TIMES OUT (cold-reset the EC)
-Secure Boot is **solved**: MOK enrolled ✅, signed module loads ✅. But the EC
-telemetry read **times out** — every command through the OEM1-cmd-17 mailbox
-returns service **status 5** (~54 ms controller timeout); the EC isn't answering
-the doorbell. Full analysis in **#10**.
-
-**Root cause (high confidence): the EC is latched in a bad state** after today's 3
-power-button OOM force-offs. A warm reboot does NOT reset the EC (it stays on
-standby power — confirmed: our post-enrollment reboot didn't clear it). Our code
-is **correct** — byte-identical to the `mathieu-lacage/dgx-spark-fan-override`
-fork, which reads *real* RPM on a healthy Spark with the same mechanism. Ruled
-out: cache mapping (WB/WT/WC all identical), firmware drift (EC `0x03000508`
-matches the doc), command framing, and OS contention (the working fork does
-nothing special).
-
-**Next action — cold-reset the EC (needs physical access to the box):**
-1. `sudo poweroff`
-2. **Unplug the power cable** (and any USB-C power); wait **~5 min** to drain the
-   EC standby rail.
-3. Reconnect power, boot.
-
-**Then retest (standalone — the enrolled MOK persists, but the `.ko` is not
-checked in, so rebuild + re-sign it first; Secure Boot requires the signature):**
-```sh
-cd ~/git/dgx-spark-fan-override/nvfanread
-make
-SIGN="/lib/modules/$(uname -r)/build/scripts/sign-file"
-"$SIGN" sha256 ~/.mok/nvfanread-mok.priv ~/.mok/nvfanread-mok.der nvfanread.ko
-sudo insmod nvfanread.ko
-cat /sys/bus/arm_ffa/devices/arm-ffa-17/telemetry   # success = 64-byte snapshot + RPM candidates
-sudo rmmod nvfanread
+## ✅ WORKING — fan RPM in `sensors` and node_exporter
+The goal is achieved end to end: **EC → hwmon → `sensors` → node_exporter →
+Prometheus.** Confirmed 2026-09-13:
 ```
-- **Snapshot returned → the EC is back.** For the full hwmon/`sensors` output,
-  the decode + hwmon driver is in **PR #11** (branch `fan-rpm-decode`, CI-green,
-  mergeable): `git checkout fan-rpm-decode`, rebuild+sign+load the same way, then
-  `sensors` — `fan1_input`/`fan2_input` should show RPM. Then merge #11.
-- **Still `Input/output error`** → EC didn't reset; deeper/unit-specific issue (#10).
+nvfanread-virtual-0:  fan0: 2700 RPM   fan1: 4050 RPM
+node_hwmon_fan_rpm{chip="devices_arm_ffa_17",sensor="fan1"} 2700
+node_hwmon_fan_rpm{chip="devices_arm_ffa_17",sensor="fan2"} 4050
+```
+Delivered in **PR #11** (merged to `main`): `nvfr_snapshot_fan_rpm()` decode + a
+hwmon device (`fan1_input`/`fan2_input`); node_exporter's `--collector.hwmon`
+picks it up automatically.
+
+### The two blockers, both solved
+1. **Secure Boot** — the module must be MOK-signed and the key enrolled (one-time,
+   needs a physical monitor; no BMC). Done. Runbook: `docs/secure-boot-signing.md`.
+2. **EC mailbox timed out** (status 5, every command) — the EC was **latched**
+   after power-button OOM force-offs. A warm reboot does not reset it; a **cold
+   AC power drain** (`poweroff` + unplug ~5 min) did. See #10. Our code was correct
+   all along — byte-identical to the mathieu-lacage fork.
+
+### Remaining
+- **#6 persistence** — auto-load at boot + DKMS MOK auto-signing so the module
+  (and node_exporter's fan metrics) survive reboots. Today the module is loaded
+  manually and must be rebuilt+signed after each reboot.
+- **#4 polish** (optional) — friendlier `sensors` labels via `/etc/sensors.d/`.
+
+Manual load after a reboot (until #6 lands):
+```sh
+cd ~/git/dgx-spark-fan-override/nvfanread && make
+"/lib/modules/$(uname -r)/build/scripts/sign-file" sha256 \
+  ~/.mok/nvfanread-mok.priv ~/.mok/nvfanread-mok.der nvfanread.ko
+sudo insmod nvfanread.ko && sensors nvfanread-*
+```
+
+### Credits / external resources
+- Upstream protocol RE: [Z841973620/dgx-spark-fan-override](https://github.com/Z841973620/dgx-spark-fan-override).
+- Validated RPM decode offsets: [mathieu-lacage/dgx-spark-fan-override](https://github.com/mathieu-lacage/dgx-spark-fan-override).
+- Cold-EC-reset (power-drain) technique: vendor docs
+  [ASUS](https://www.asus.com/support/faq/1050239/) and
+  [MSI](https://www.msi.com/support/technical_details/NB_EC_RESET).
 
 **Decode (already solved, from the fork):** in the command-7 reply,
 `fan0_rpm = le16(reply[7])`, `fan1_rpm = le16(reply[9])` → in nvfanread's 64-byte
