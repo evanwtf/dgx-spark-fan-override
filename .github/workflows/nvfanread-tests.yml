@@ -12,7 +12,9 @@ on:
 
 jobs:
   unit-tests:
-    runs-on: ubuntu-latest
+    # Org self-hosted runner (matches evanwtf/local-llm). The tests are pure
+    # portable C, so any Linux X64 runner works; keeps CI off metered minutes.
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
       # The pure protocol logic is kernel- and hardware-independent, so the
