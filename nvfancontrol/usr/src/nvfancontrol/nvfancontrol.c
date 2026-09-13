@@ -68,6 +68,7 @@ static void restore_shared_page(struct device *dev, u8 *shm,
 				int *result)
 {
 	memcpy(shm, snapshot, ESPI_NS_SHM_PROTOCOL_SIZE);
+	/* Ensure the restore write lands in the shared page before we verify it. */
 	mb();
 
 	if (memcmp(shm, snapshot, ESPI_NS_SHM_PROTOCOL_SIZE)) {
@@ -148,6 +149,7 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 	frame[2] = GENERIC_OUTPUT_OFFSET;
 	memcpy(&frame[GENERIC_DATA_OFFSET], request, sizeof(request));
 	memcpy(shm, frame, sizeof(frame));
+	/* Publish the request frame to the shared page before the doorbell send. */
 	mb();
 
 	if (target == TARGET_FULL_RPM)
@@ -212,6 +214,7 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 		goto out_unmap;
 	}
 
+	/* Order the ready-flag load ahead of reading the reply payload below. */
 	mb();
 	memcpy(response, &shm[GENERIC_DATA_OFFSET], sizeof(response));
 	dev_info(&fdev->dev,
