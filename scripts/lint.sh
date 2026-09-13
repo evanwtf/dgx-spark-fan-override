@@ -26,8 +26,9 @@ if [ -z "$CHECKPATCH" ]; then
 fi
 
 # Every C/header file we maintain. Globs pick up new files automatically.
+# Exclude generated kbuild artifacts (e.g. *.mod.c) that appear after a build.
 c_files="$(ls nvfanread/*.c nvfanread/*.h nvfanread/tests/*.c \
-	nvfancontrol/usr/src/nvfancontrol/*.c 2>/dev/null)"
+	nvfancontrol/usr/src/nvfancontrol/*.c 2>/dev/null | grep -v '\.mod\.c$')"
 
 if [ -n "$CHECKPATCH" ]; then
 	echo "== checkpatch ($CHECKPATCH) =="

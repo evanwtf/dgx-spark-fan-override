@@ -150,6 +150,36 @@ static void test_rpm_classification(void)
 	CHECK_EQ(nvfr_is_rpm_candidate(100) != 0, nvfr_rpm_flags(100) != 0);
 }
 
+static void test_fan_rpm_decode(void)
+{
+	nvfr_u8 snap[NVFR_TELEMETRY_LEN];
+	nvfr_u16 fan0, fan1;
+	unsigned int i;
+
+	for (i = 0; i < NVFR_TELEMETRY_LEN; i++)
+		snap[i] = 0;
+
+	/* fan0 at bytes 4-5 (LE) = 0x0813 = 2067; fan1 at 6-7 = 0x0A28 = 2600 */
+	snap[4] = 0x13;
+	snap[5] = 0x08;
+	snap[6] = 0x28;
+	snap[7] = 0x0A;
+	nvfr_snapshot_fan_rpm(snap, &fan0, &fan1);
+	CHECK_EQ(fan0, 2067);
+	CHECK_EQ(fan1, 2600);
+
+	/* Distinct offsets: changing only fan1's bytes leaves fan0 alone. */
+	snap[6] = 0xBC;
+	snap[7] = 0x34;                 /* 0x34BC = 13500 */
+	nvfr_snapshot_fan_rpm(snap, &fan0, &fan1);
+	CHECK_EQ(fan0, 2067);
+	CHECK_EQ(fan1, 13500);
+
+	/* Snapshot offsets line up with the documented reply offsets 7 and 9. */
+	CHECK_EQ(NVFR_SNAPSHOT_FAN0_RPM_OFFSET + NVFR_EC_REQUEST_LEN, 7);
+	CHECK_EQ(NVFR_SNAPSHOT_FAN1_RPM_OFFSET + NVFR_EC_REQUEST_LEN, 9);
+}
+
 /* Guard the compile-time constants the module and decode logic depend on. */
 static void test_layout_constants(void)
 {
@@ -168,6 +198,7 @@ int main(void)
 	test_mailbox_idle();
 	test_reply_header_ok();
 	test_rpm_classification();
+	test_fan_rpm_decode();
 	test_layout_constants();
 
 	if (g_failures == 0) {

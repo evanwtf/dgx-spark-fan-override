@@ -222,6 +222,15 @@ static ssize_t telemetry_show(struct device *dev, struct device_attribute *attr,
 		len += scnprintf(buf + len, PAGE_SIZE - len,
 				 "%02x: %16ph\n", i, &snap[i]);
 
+	{
+		u16 fan0_rpm, fan1_rpm;
+
+		nvfr_snapshot_fan_rpm(snap, &fan0_rpm, &fan1_rpm);
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "# decoded: fan0_rpm=%u fan1_rpm=%u (snapshot offsets 4, 6)\n",
+				 fan0_rpm, fan1_rpm);
+	}
+
 	len += scnprintf(buf + len, PAGE_SIZE - len,
 			 "# le16 candidates in fan RPM ranges (fan0 %u-%u, fan1 %u-%u):\n",
 			 NVFR_FAN0_RPM_MIN, NVFR_FAN0_RPM_MAX,
