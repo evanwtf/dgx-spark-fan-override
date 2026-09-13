@@ -38,8 +38,7 @@ done
 src="$stage/usr/src/${name}-${ver}"
 mkdir -p "$src"
 cp nvfanread/nvfanread.c nvfanread/nvfanread_proto.h nvfanread/Makefile \
-   nvfanread/dkms.conf nvfanread/dkms-sign.sh "$src/"
-chmod 0755 "$src/dkms-sign.sh"
+   nvfanread/dkms.conf "$src/"
 
 # Runtime config: boot auto-load + sensors labels.
 mkdir -p "$stage/lib/modules-load.d" "$stage/etc/sensors.d"
