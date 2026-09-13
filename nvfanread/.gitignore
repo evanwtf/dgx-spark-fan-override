@@ -9,3 +9,6 @@
 *.symvers
 *.order
 .tmp_versions/
+
+# Userspace unit-test binary
+tests/test_proto

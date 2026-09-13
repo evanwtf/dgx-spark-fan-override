@@ -1,0 +1,21 @@
+name: nvfanread unit tests
+
+on:
+  push:
+    paths:
+      - 'nvfanread/**'
+      - '.github/workflows/nvfanread-tests.yml'
+  pull_request:
+    paths:
+      - 'nvfanread/**'
+      - '.github/workflows/nvfanread-tests.yml'
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The pure protocol logic is kernel- and hardware-independent, so the
+      # unit tests build and run with just a C compiler.
+      - name: Run protocol unit tests
+        run: make -C nvfanread/tests test

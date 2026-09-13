@@ -16,8 +16,10 @@
  * little-endian u16 values that fall inside the known fan RPM ranges, so the
  * current-RPM offsets can be decoded and later surfaced through hwmon.
  *
- * The mailbox handshake mirrors the override driver: it refuses a non-idle
- * mailbox, snapshots the shared page, and restores it afterwards. Requests are
+ * The pure protocol logic lives in nvfanread_proto.h and is unit-tested in
+ * userspace; this file adds the FF-A / shared-page I/O around it. The mailbox
+ * handshake mirrors the override driver: it refuses a non-idle mailbox,
+ * snapshots the shared page, and restores it afterwards. Requests are
  * serialized under a mutex.
  */
 
@@ -39,40 +41,17 @@
 #include <linux/unaligned.h>
 #include <linux/uuid.h>
 
+#include "nvfanread_proto.h"
+
 #define ESPI_OEM_GENERIC_EMI       17U
 
 #define ESPI_NS_SHM_PA             0x933dd000ULL
 #define ESPI_NS_SHM_SIZE           0x1000U
 
-/* Shared-page frame layout (OEM1 command 17). */
-#define FRAME_INPUT_LEN            0U
-#define FRAME_OUTPUT_LEN           1U
-#define FRAME_OUTPUT_OFFSET        2U
-#define FRAME_INPUT_ACCEPTED       3U
-#define FRAME_OUTPUT_READY         4U
-#define FRAME_DATA_OFFSET          0x10U
-
-/* EC generic frame: [0]=outer service, [1]=inner command, [2]=status. */
-#define THERMAL_OUTER_COMMAND      0x07U
-#define THERMAL_TELEMETRY_READ     0x07U   /* EC inner command 7, read-only */
-
-#define EC_REQUEST_LEN             3U      /* header only; command 7 has no input data */
-#define TELEMETRY_LEN              64U     /* bytes copied from EC SRAM 0x1188E2 */
-#define EC_REPLY_LEN               (EC_REQUEST_LEN + TELEMETRY_LEN)
-#define TELEMETRY_DATA_OFFSET      (FRAME_DATA_OFFSET + EC_REQUEST_LEN)
-
-/* Region of the shared page we snapshot and restore around a request. */
-#define SNAP_LEN                   128U
 
 #define REPLY_TIMEOUT_MS           5000U
 #define REPLY_POLL_MS              10U
 #define ESPI_TIMEOUT_FLOOR_US      40000LL
-
-/* Documented per-channel RPM ranges, used only to flag decode candidates. */
-#define FAN0_RPM_MIN               1260U
-#define FAN0_RPM_MAX               9000U
-#define FAN1_RPM_MIN               1890U
-#define FAN1_RPM_MAX               13500U
 
 struct nvfanread_state {
 	struct ffa_device *fdev;
@@ -80,12 +59,13 @@ struct nvfanread_state {
 };
 
 static void restore_shared_page(struct device *dev, u8 *shm,
-				const u8 snapshot[SNAP_LEN])
+				const u8 snapshot[NVFR_SNAP_LEN])
 {
-	memcpy(shm, snapshot, SNAP_LEN);
+	memcpy(shm, snapshot, NVFR_SNAP_LEN);
+	/* Ensure the restore write lands in the shared page before we verify it. */
 	mb();
 
-	if (memcmp(shm, snapshot, SNAP_LEN))
+	if (memcmp(shm, snapshot, NVFR_SNAP_LEN))
 		dev_crit(dev,
 			 "SHARED-BUFFER RESTORE VERIFY FAILED at physical address %#llx\n",
 			 ESPI_NS_SHM_PA);
@@ -95,13 +75,13 @@ static void restore_shared_page(struct device *dev, u8 *shm,
  * Issue EC command 7 and copy the 64-byte telemetry snapshot into @out.
  * Returns 0 on success. Never writes an override slot.
  */
-static int read_telemetry(struct nvfanread_state *state, u8 out[TELEMETRY_LEN])
+static int read_telemetry(struct nvfanread_state *state,
+			  u8 out[NVFR_TELEMETRY_LEN])
 {
 	struct ffa_device *fdev = state->fdev;
 	struct ffa_send_direct_data2 msg = {};
-	u8 snapshot[SNAP_LEN];
-	u8 frame[SNAP_LEN] = {};
-	u8 request[EC_REQUEST_LEN];
+	u8 snapshot[NVFR_SNAP_LEN];
+	u8 frame[NVFR_SNAP_LEN];
 	u8 *payload = (u8 *)msg.data;
 	u8 *shm;
 	unsigned long pfn = PHYS_PFN(ESPI_NS_SHM_PA);
@@ -112,6 +92,11 @@ static int read_telemetry(struct nvfanread_state *state, u8 out[TELEMETRY_LEN])
 	ktime_t start;
 	s64 elapsed_us;
 	int ret;
+
+	if (nvfr_build_request_frame(frame, sizeof(frame))) {
+		dev_err(&fdev->dev, "internal error: request frame too small\n");
+		return -EINVAL;
+	}
 
 	map_memory = pfn_is_map_memory(pfn);
 	if (map_memory)
@@ -131,25 +116,18 @@ static int read_telemetry(struct nvfanread_state *state, u8 out[TELEMETRY_LEN])
 
 	memcpy(snapshot, shm, sizeof(snapshot));
 
-	if (snapshot[FRAME_INPUT_ACCEPTED] != 0 ||
-	    snapshot[FRAME_OUTPUT_READY] != 0) {
+	if (!nvfr_mailbox_idle(snapshot[NVFR_FRAME_INPUT_ACCEPTED],
+			       snapshot[NVFR_FRAME_OUTPUT_READY])) {
 		dev_err(&fdev->dev,
 			"refusing request: shared mailbox is not idle (accepted=%#04x ready=%#04x)\n",
-			snapshot[FRAME_INPUT_ACCEPTED],
-			snapshot[FRAME_OUTPUT_READY]);
+			snapshot[NVFR_FRAME_INPUT_ACCEPTED],
+			snapshot[NVFR_FRAME_OUTPUT_READY]);
 		ret = -EBUSY;
 		goto out_unmap;
 	}
 
-	request[0] = THERMAL_OUTER_COMMAND;
-	request[1] = THERMAL_TELEMETRY_READ;
-	request[2] = 0;
-
-	frame[FRAME_INPUT_LEN] = EC_REQUEST_LEN;
-	frame[FRAME_OUTPUT_LEN] = EC_REPLY_LEN;
-	frame[FRAME_OUTPUT_OFFSET] = 0;
-	memcpy(&frame[FRAME_DATA_OFFSET], request, sizeof(request));
 	memcpy(shm, frame, sizeof(frame));
+	/* Publish the request frame to the shared page before the doorbell send. */
 	mb();
 
 	payload[0] = ESPI_OEM_GENERIC_EMI;
@@ -179,41 +157,39 @@ static int read_telemetry(struct nvfanread_state *state, u8 out[TELEMETRY_LEN])
 	}
 
 	for (elapsed = 0; elapsed < REPLY_TIMEOUT_MS; elapsed += REPLY_POLL_MS) {
-		if (READ_ONCE(shm[FRAME_OUTPUT_READY]) == 1)
+		if (READ_ONCE(shm[NVFR_FRAME_OUTPUT_READY]) == 1)
 			break;
 		msleep(REPLY_POLL_MS);
 	}
 
-	if (READ_ONCE(shm[FRAME_OUTPUT_READY]) != 1) {
+	if (READ_ONCE(shm[NVFR_FRAME_OUTPUT_READY]) != 1) {
 		dev_crit(&fdev->dev,
 			 "OUTPUT TIMEOUT after %u ms: accepted=%#04x ready=%#04x\n",
 			 REPLY_TIMEOUT_MS,
-			 READ_ONCE(shm[FRAME_INPUT_ACCEPTED]),
-			 READ_ONCE(shm[FRAME_OUTPUT_READY]));
+			 READ_ONCE(shm[NVFR_FRAME_INPUT_ACCEPTED]),
+			 READ_ONCE(shm[NVFR_FRAME_OUTPUT_READY]));
 		ret = -ETIMEDOUT;
 		restore_shared_page(&fdev->dev, shm, snapshot);
 		goto out_unmap;
 	}
 
+	/* Order the ready-flag load ahead of reading the reply payload below. */
 	mb();
 
-	/* Echoed header first: [07][07][00] on success. */
-	if (shm[FRAME_DATA_OFFSET] != THERMAL_OUTER_COMMAND ||
-	    shm[FRAME_DATA_OFFSET + 1] != THERMAL_TELEMETRY_READ ||
-	    shm[FRAME_DATA_OFFSET + 2] != 0) {
+	if (!nvfr_reply_header_ok(&shm[NVFR_FRAME_DATA_OFFSET])) {
 		dev_crit(&fdev->dev,
 			 "UNEXPECTED REPLY HEADER: %#04x %#04x %#04x\n",
-			 shm[FRAME_DATA_OFFSET], shm[FRAME_DATA_OFFSET + 1],
-			 shm[FRAME_DATA_OFFSET + 2]);
+			 shm[NVFR_FRAME_DATA_OFFSET],
+			 shm[NVFR_FRAME_DATA_OFFSET + 1],
+			 shm[NVFR_FRAME_DATA_OFFSET + 2]);
 		ret = -EPROTO;
 		restore_shared_page(&fdev->dev, shm, snapshot);
 		goto out_unmap;
 	}
 
-	memcpy(out, &shm[TELEMETRY_DATA_OFFSET], TELEMETRY_LEN);
+	memcpy(out, &shm[NVFR_TELEMETRY_DATA_OFFSET], NVFR_TELEMETRY_LEN);
 	dev_info(&fdev->dev,
-		 "telemetry read OK in <=%u ms (status field, decode via sysfs)\n",
-		 elapsed);
+		 "telemetry read OK in <=%u ms (decode via sysfs)\n", elapsed);
 
 	ret = 0;
 	restore_shared_page(&fdev->dev, shm, snapshot);
@@ -227,7 +203,7 @@ static ssize_t telemetry_show(struct device *dev, struct device_attribute *attr,
 			      char *buf)
 {
 	struct nvfanread_state *state = dev_get_drvdata(dev);
-	u8 snap[TELEMETRY_LEN];
+	u8 snap[NVFR_TELEMETRY_LEN];
 	ssize_t len = 0;
 	unsigned int i;
 	int ret;
@@ -242,21 +218,25 @@ static ssize_t telemetry_show(struct device *dev, struct device_attribute *attr,
 
 	len += scnprintf(buf + len, PAGE_SIZE - len,
 			 "# EC command 7 telemetry snapshot (64 bytes @ 0x1188E2)\n");
-	for (i = 0; i < TELEMETRY_LEN; i += 16)
+	for (i = 0; i < NVFR_TELEMETRY_LEN; i += 16)
 		len += scnprintf(buf + len, PAGE_SIZE - len,
 				 "%02x: %16ph\n", i, &snap[i]);
 
 	len += scnprintf(buf + len, PAGE_SIZE - len,
 			 "# le16 candidates in fan RPM ranges (fan0 %u-%u, fan1 %u-%u):\n",
-			 FAN0_RPM_MIN, FAN0_RPM_MAX, FAN1_RPM_MIN, FAN1_RPM_MAX);
-	for (i = 0; i + 1 < TELEMETRY_LEN; i++) {
-		u16 v = get_unaligned_le16(&snap[i]);
+			 NVFR_FAN0_RPM_MIN, NVFR_FAN0_RPM_MAX,
+			 NVFR_FAN1_RPM_MIN, NVFR_FAN1_RPM_MAX);
+	for (i = 0; i + 1 < NVFR_TELEMETRY_LEN; i++) {
+		u16 v = nvfr_le16(&snap[i]);
+		unsigned int flags;
 
-		if (v >= FAN0_RPM_MIN && v <= FAN1_RPM_MAX)
-			len += scnprintf(buf + len, PAGE_SIZE - len,
-					 "  off 0x%02x = %u%s%s\n", i, v,
-					 (v <= FAN0_RPM_MAX) ? " [fan0?]" : "",
-					 (v >= FAN1_RPM_MIN) ? " [fan1?]" : "");
+		if (!nvfr_is_rpm_candidate(v))
+			continue;
+		flags = nvfr_rpm_flags(v);
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "  off 0x%02x = %u%s%s\n", i, v,
+				 (flags & NVFR_CAND_FAN0) ? " [fan0?]" : "",
+				 (flags & NVFR_CAND_FAN1) ? " [fan1?]" : "");
 	}
 
 	return len;
