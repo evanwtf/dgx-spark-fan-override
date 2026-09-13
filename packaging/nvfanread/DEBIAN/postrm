@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+case "${1:-}" in
+	remove|purge)
+		depmod -a 2>/dev/null || true
+		;;
+esac
+
+# Note: the MOK key material under /var/lib/nvfanread/mok is intentionally NOT
+# removed here -- it is user-provided and may be reused. Remove it by hand if
+# you really mean to.
+
+exit 0

@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+module=nvfanread
+version=1.0.0
+
+case "${1:-}" in
+	configure) ;;
+	*) exit 0 ;;
+esac
+
+# Register + build (POST_BUILD signs with the MOK) + install via DKMS.
+dkms add -m "$module" -v "$version" 2>/dev/null || true
+dkms build -m "$module" -v "$version"
+dkms install -m "$module" -v "$version" --force
+depmod -a
+
+# If Secure Boot is on but the built module is unsigned, it won't load: warn
+# with the fix instead of leaving it silently broken.
+if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -qi enabled; then
+	ko="$(modinfo -n "$module" 2>/dev/null || true)"
+	if [ -n "$ko" ] && ! modinfo "$ko" 2>/dev/null | grep -q '^signer:'; then
+		echo "nvfanread: WARNING Secure Boot is enabled but the module is UNSIGNED -- it will not load." >&2
+		echo "nvfanread: place your enrolled MOK at /var/lib/nvfanread/mok/{mok.priv,mok.der}" >&2
+		echo "nvfanread: (or set NVFANREAD_MOK_KEY / NVFANREAD_MOK_CERT in /etc/nvfanread/signing.conf), then reinstall." >&2
+	fi
+fi
+
+# Load now (best effort); /lib/modules-load.d handles boot.
+modprobe "$module" 2>/dev/null ||
+	echo "nvfanread: not loaded now (see dmesg); will load on next boot via modules-load.d"
+
+exit 0

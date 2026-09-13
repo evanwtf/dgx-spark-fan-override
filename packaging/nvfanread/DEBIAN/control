@@ -1,0 +1,12 @@
+Package: nvfanread
+Version: 1.0.0
+Priority: optional
+Architecture: arm64
+Maintainer: Evan Hoffman <evandhoffman@gmail.com>
+Depends: dkms, kmod, make, gcc, libc6-dev
+Description: DGX Spark read-only fan-RPM hwmon driver (DKMS)
+ Reads fan tachometer telemetry from the DGX Spark EC over FF-A and exposes it
+ as a hwmon device (fan1_input / fan2_input), so lm-sensors and node_exporter
+ report fan RPM. Read-only: it never writes an EC override slot. The module is
+ built and signed (with the machine's enrolled MOK) via DKMS at install time,
+ and auto-loads at boot.
