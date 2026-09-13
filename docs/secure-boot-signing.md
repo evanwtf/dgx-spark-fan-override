@@ -130,6 +130,36 @@ do it during a GPU-idle window with someone at the machine.
 > and it drops `lockdown` to `none` (opens `/dev/mem`, kexec, unsigned modules)
 > — strictly worse posture than trusting only our own key.
 
+### If you forget the one-time password (or enrollment doesn't take)
+
+The one-time password only gates the MokManager confirmation — it is **not** the
+MOK private key and **not** stored in 1Password. If you forget it, or MokManager
+times out / you cancel, the certificate is left **pending** (unenrolled) with the
+old password, and a plain reboot will just ask for that same forgotten password.
+Clear the stale pending request and re-stage with a new password:
+
+```sh
+# 1. Check state
+sudo mokutil --list-enrolled | grep -i nvfanread   # empty  => not enrolled
+sudo mokutil --list-new       | grep -i nvfanread   # non-empty => a stale pending request
+
+# 2. Cancel the stale pending request — no password needed (root clears MokNew)
+sudo mokutil --revoke-import
+
+# 3. Confirm it's gone
+sudo mokutil --list-new                             # should show nothing pending
+
+# 4. Re-stage with a NEW password (WRITE IT DOWN), confirm, and reboot
+sudo mokutil --import ~/.mok/nvfanread-mok.der       # type the new password twice
+sudo mokutil --list-new                             # confirms "CN=nvfanread module signing (evan MOK)"
+sudo reboot
+# → MokManager: press a key → Enroll MOK → View key 0 → Continue → Yes → NEW password → Reboot
+```
+
+`mokutil --revoke-import` clears the pending request as root without the old
+password, so a forgotten password is fully recoverable — nothing is lost, and the
+signing key is untouched.
+
 ## Step 4 — Load and verify
 
 ```sh
