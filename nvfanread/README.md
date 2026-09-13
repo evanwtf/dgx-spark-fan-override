@@ -42,7 +42,7 @@ mailbox handshake here is derived from that project's `nvfancontrol.c`
 ```sh
 make            # build the kernel module (needs matching kernel headers)
 make test       # run userspace unit tests (no kernel/hardware needed)
-make lint       # advisory checkpatch style check
+make lint       # repo-wide lint: checkpatch (C) + shellcheck (shell)
 make check      # build the module AND run the unit tests
 ```
 

@@ -50,6 +50,7 @@ static void test_le16(void)
 		const nvfr_u8 zero[] = { 0x00, 0x00 };
 		const nvfr_u8 lo[]   = { 0xEC, 0x04 };   /* 0x04EC = 1260 */
 		const nvfr_u8 ff[]   = { 0xFF, 0xFF };
+
 		CHECK_EQ(nvfr_le16(zero), 0);
 		CHECK_EQ(nvfr_le16(lo), 1260);
 		CHECK_EQ(nvfr_le16(ff), 0xFFFF);

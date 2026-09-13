@@ -2,7 +2,6 @@ obj-m += nvfanread.o
 
 KERNELRELEASE ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KERNELRELEASE)/build
-CHECKPATCH := $(KDIR)/scripts/checkpatch.pl
 
 .PHONY: all clean test lint check
 
@@ -18,15 +17,10 @@ clean:
 test:
 	$(MAKE) -C tests test
 
-# Advisory kernel style check. NEW_TYPEDEFS is intentionally ignored: the
-# shared header defines dual-mode (kernel + userspace) fixed-width aliases.
+# Repo-wide lint (checkpatch + shellcheck) lives at the top level; delegate so
+# there is a single source of truth.
 lint:
-	@if [ -x "$(CHECKPATCH)" ]; then \
-		"$(CHECKPATCH)" --no-tree --terse --ignore NEW_TYPEDEFS \
-			-f nvfanread.c nvfanread_proto.h; \
-	else \
-		echo "checkpatch.pl not found under $(KDIR); skipping lint"; \
-	fi
+	$(MAKE) -C .. lint
 
 # Full gate: the module must build and the unit tests must pass.
 check: all test
