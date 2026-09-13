@@ -10,26 +10,29 @@ via a **read-only** hwmon driver that reads the EC's fan telemetry over FF-A.
 The box's tachometers are EC-owned; nothing in the OS exposes fan RPM today
 (`sensors` shows temps only). Tracking issue: **#7**.
 
-## ⛔ Immediate blocker + next action (do this first)
-Loading the module is blocked by **Secure Boot** — unsigned modules are rejected
-(`Key was rejected by service`). The module is already signed with our MOK, but
-**the MOK is not yet enrolled**. Full runbook: [`docs/secure-boot-signing.md`](secure-boot-signing.md).
+## ⛔ Immediate blocker + next action — READY TO ENROLL
+Loading is blocked by **Secure Boot** (`Key was rejected by service`); the module
+is signed with our MOK. **Current state (2026-09-13, pre-reboot):**
+- ✅ **MOK staged** — `sudo mokutil --import ~/.mok/nvfanread-mok.der` was run and
+  a one-time password set. `mokutil --list-new` confirms `[key 1]`, Serial
+  `4f:9e:7d:…:d8:16`, `CN=nvfanread module signing (evan MOK)` — matches our key.
+- ✅ **HDMI monitor + USB-C keyboard connected.**
+- ⏳ **Reboot pending.** This reboot WILL trigger MokManager and enroll the key.
 
-As of the reboot in progress, **`mokutil --import` had NOT been run** — so a bare
-reboot enrolls nothing. Before the enrollment reboot, run on the DGX:
+**At the reboot — MokManager (blue screen):** press a key within ~10 s →
+**Enroll MOK → View key 0** (verify `CN=nvfanread module signing`) **→ Continue →
+Yes →** type the password set at import **→ Reboot**. One-time; the box is headless
+again afterwards.
+
+**After boot (over `ssh dgx`, e.g. from the Mac):**
 ```sh
-sudo mokutil --import ~/.mok/nvfanread-mok.der   # prompts for a throwaway password (typed twice)
-sudo mokutil --list-new                          # confirm "nvfanread module signing (evan MOK)" is staged
-```
-Then attach an **HDMI monitor + wired USB-C keyboard**, `sudo reboot`, and at the
-blue **MokManager** screen: press a key → Enroll MOK → View key 0 → Continue →
-Yes → type the password → Reboot. Enrollment is one-time; afterwards the box is
-headless again forever. Then:
-```sh
-mokutil --list-enrolled | grep -i nvfanread
+mokutil --list-enrolled | grep -i nvfanread            # the key should now appear
 sudo insmod ~/git/dgx-spark-fan-override/nvfanread/nvfanread.ko
-cat /sys/bus/arm_ffa/devices/arm-ffa-17/telemetry
+cat /sys/bus/arm_ffa/devices/arm-ffa-17/telemetry        # capture the 64-byte snapshot -> issue #1
+sudo rmmod nvfanread
 ```
+If MokManager doesn't appear or enrollment fails, re-stage with `mokutil --import`
+and reboot again (harmless). Full runbook: [`secure-boot-signing.md`](secure-boot-signing.md).
 
 ## What's done
 - **Read-only `nvfanread` module** (the *decoder*): binds `arm-ffa-17`, issues only
