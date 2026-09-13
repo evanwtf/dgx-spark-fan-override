@@ -46,7 +46,8 @@ sh_files="nvfancontrol/DEBIAN/postinst \
 	nvfancontrol/DEBIAN/prerm \
 	nvfancontrol/DEBIAN/postrm \
 	nvfancontrol/usr/sbin/nvfancontrol \
-	scripts/lint.sh"
+	scripts/lint.sh \
+	scripts/build-debs.sh"
 
 if command -v shellcheck >/dev/null 2>&1; then
 	echo "== shellcheck =="

@@ -1,0 +1,39 @@
+name: release
+
+# A tag is the only trigger: cutting a release is `git tag -a vX.Y.Z && git
+# push --tags`. Everything below is a gate or the publish step.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      # Gate 1: the same lint + tests every push runs (checkpatch is skipped in
+      # CI; shellcheck and the unit tests run).
+      - name: Lint and unit tests
+        run: |
+          make lint
+          make test
+
+      # Gate 2 + build: each package's control Version must equal the tag
+      # (leading "v" stripped), or the build fails.
+      - name: Build packages
+        run: sh scripts/build-debs.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/*.deb \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

@@ -2,13 +2,7 @@ name: nvfanread unit tests
 
 on:
   push:
-    paths:
-      - 'nvfanread/**'
-      - '.github/workflows/nvfanread-tests.yml'
   pull_request:
-    paths:
-      - 'nvfanread/**'
-      - '.github/workflows/nvfanread-tests.yml'
 
 jobs:
   unit-tests:
