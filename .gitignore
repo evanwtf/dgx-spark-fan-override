@@ -1,2 +1,17 @@
 # Release build output
 /dist/
+
+# Module-signing key material — NEVER commit. Lives in ~/.mok on the box and is
+# backed up in 1Password; these patterns are defense-in-depth in case any key
+# material is ever copied into the tree.
+*.priv
+*.key
+*.pem
+*.der
+*.crt
+*.p12
+*.pfx
+MOK*
+mok*
+*_mok*
+signing_key*
