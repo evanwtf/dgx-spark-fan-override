@@ -26,9 +26,17 @@ if [ -z "$CHECKPATCH" ]; then
 fi
 
 # Every C/header file we maintain. Globs pick up new files automatically.
-# Exclude generated kbuild artifacts (e.g. *.mod.c) that appear after a build.
-c_files="$(ls nvfanread/*.c nvfanread/*.h nvfanread/tests/*.c \
-	nvfancontrol/usr/src/nvfancontrol/*.c 2>/dev/null | grep -v '\.mod\.c$')"
+# Every C/header file we maintain, excluding generated kbuild artifacts
+# (*.mod.c). Built with a glob + case rather than `ls | grep` (shellcheck SC2010).
+c_files=""
+for f in nvfanread/*.c nvfanread/*.h nvfanread/tests/*.c \
+	 nvfancontrol/usr/src/nvfancontrol/*.c; do
+	[ -e "$f" ] || continue
+	case "$f" in
+	*.mod.c) continue ;;
+	esac
+	c_files="$c_files $f"
+done
 
 if [ -n "$CHECKPATCH" ]; then
 	echo "== checkpatch ($CHECKPATCH) =="
