@@ -56,6 +56,28 @@ kernel or hardware, and is what CI runs. The FF-A / shared-page I/O in
 `nvfanread.c` cannot be unit-tested without loading the module; it is validated
 at load time on real hardware.
 
+## Persistent install (DKMS `.deb`)
+
+To auto-load at boot and rebuild+sign on kernel updates, install the DKMS
+package. Under Secure Boot, first point DKMS's signing at a MOK you've enrolled
+(see [`../docs/secure-boot-signing.md`](../docs/secure-boot-signing.md)):
+
+```sh
+# one-time: configure DKMS to sign with your enrolled MOK
+sudo scripts/setup-signing.sh ~/.mok/nvfanread-mok.priv ~/.mok/nvfanread-mok.der
+
+# build + install the package (needs dkms)
+sudo apt-get install -y dkms
+sh scripts/build-nvfanread-deb.sh
+sudo dpkg -i dist/nvfanread_1.0.0_arm64.deb
+```
+
+The package registers the module with DKMS (built + signed on install and on
+every kernel update), drops `/lib/modules-load.d/nvfanread.conf` for boot
+auto-load, and installs `sensors` labels. Verify with `sensors nvfanread-*`. A
+prebuilt `.deb` is also attached to GitHub Releases (and to each `package` CI
+run's artifacts).
+
 ## Usage (once loaded)
 
 ```sh

@@ -58,10 +58,10 @@ sh_files="nvfancontrol/DEBIAN/postinst \
 	packaging/nvfanread/DEBIAN/postinst \
 	packaging/nvfanread/DEBIAN/prerm \
 	packaging/nvfanread/DEBIAN/postrm \
-	nvfanread/dkms-sign.sh \
 	scripts/lint.sh \
 	scripts/build-debs.sh \
-	scripts/build-nvfanread-deb.sh"
+	scripts/build-nvfanread-deb.sh \
+	scripts/setup-signing.sh"
 
 if command -v shellcheck >/dev/null 2>&1; then
 	echo "== shellcheck =="

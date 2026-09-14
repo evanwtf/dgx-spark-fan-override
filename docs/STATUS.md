@@ -30,18 +30,22 @@ picks it up automatically.
    AC power drain** (`poweroff` + unplug ~5 min) did. See #10. Our code was correct
    all along — byte-identical to the mathieu-lacage fork.
 
-### Remaining
-- **#6 persistence** — auto-load at boot + DKMS MOK auto-signing so the module
-  (and node_exporter's fan metrics) survive reboots. Today the module is loaded
-  manually and must be rebuilt+signed after each reboot.
-- **#4 polish** (optional) — friendlier `sensors` labels via `/etc/sensors.d/`.
+### Done — persistent install
+- **#6** — packaged as a DKMS `.deb` (`packaging/nvfanread/` +
+  `scripts/build-nvfanread-deb.sh`): builds + signs (with the enrolled MOK, via a
+  DKMS framework drop-in written by `scripts/setup-signing.sh`) + installs on the
+  target, auto-loads at boot (`/lib/modules-load.d/nvfanread.conf`), and rebuilds
+  on kernel updates (`AUTOINSTALL=yes`). Installed and verified on the box.
+- **#4** — friendlier `sensors` labels ("Fan 0" / "Fan 1") ship in the package.
+- Downloadable `.deb` — built + uploaded by the `package` CI job on every
+  push/PR; attached to GitHub Releases on tag.
 
-Manual load after a reboot (until #6 lands):
+Install (one-time signing setup, then the package):
 ```sh
-cd ~/git/dgx-spark-fan-override/nvfanread && make
-"/lib/modules/$(uname -r)/build/scripts/sign-file" sha256 \
-  ~/.mok/nvfanread-mok.priv ~/.mok/nvfanread-mok.der nvfanread.ko
-sudo insmod nvfanread.ko && sensors nvfanread-*
+sudo scripts/setup-signing.sh ~/.mok/nvfanread-mok.priv ~/.mok/nvfanread-mok.der
+sudo apt-get install -y dkms
+sh scripts/build-nvfanread-deb.sh
+sudo dpkg -i dist/nvfanread_1.0.0_arm64.deb
 ```
 
 ### Credits / external resources
