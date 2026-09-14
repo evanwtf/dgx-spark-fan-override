@@ -48,6 +48,15 @@ sh scripts/build-nvfanread-deb.sh
 sudo dpkg -i dist/nvfanread_1.0.0_arm64.deb
 ```
 
+### After a reboot — verify (all should just work, no manual steps)
+```sh
+lsmod | grep nvfanread                                    # auto-loaded via modules-load.d
+sensors nvfanread-*                                       # Fan 0 / Fan 1 RPM
+curl -s localhost:9100/metrics | grep node_hwmon_fan_rpm  # in node_exporter/Prometheus
+dkms status nvfanread                                     # installed (rebuilds+re-signs on kernel updates)
+```
+Already deployed on this box (DKMS-installed, MOK-signed, auto-load) as of 2026-09-13.
+
 ### Credits / external resources
 - Upstream protocol RE: [Z841973620/dgx-spark-fan-override](https://github.com/Z841973620/dgx-spark-fan-override).
 - Validated RPM decode offsets: [mathieu-lacage/dgx-spark-fan-override](https://github.com/mathieu-lacage/dgx-spark-fan-override).
