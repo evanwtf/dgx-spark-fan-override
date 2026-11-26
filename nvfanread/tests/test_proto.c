@@ -302,6 +302,38 @@ static void test_cache_fresh(void)
 	CHECK_EQ(NVFR_CACHE_US, 200000);
 }
 
+/*
+ * Mailbox lock retry: a busy region is tried again only inside both bounds.
+ * Neither bound may be zero, or a module that holds the lock for a normal
+ * transaction would make every other request fail at once.
+ */
+static void test_lock_retry_policy(void)
+{
+	/* Retries while both bounds hold. */
+	CHECK(nvfr_lock_should_retry(1, 0));
+	CHECK(nvfr_lock_should_retry(NVFR_LOCK_MAX_ATTEMPTS - 1,
+				     NVFR_LOCK_RETRY_BUDGET_US - 1));
+
+	/* The attempt bound stops it. */
+	CHECK(!nvfr_lock_should_retry(NVFR_LOCK_MAX_ATTEMPTS, 0));
+	CHECK(!nvfr_lock_should_retry(NVFR_LOCK_MAX_ATTEMPTS + 1, 0));
+
+	/* The time bound stops it. */
+	CHECK(!nvfr_lock_should_retry(1, NVFR_LOCK_RETRY_BUDGET_US));
+	CHECK(!nvfr_lock_should_retry(1, NVFR_LOCK_RETRY_BUDGET_US + 1));
+
+	/* A clock that went back must not extend the wait. */
+	CHECK(!nvfr_lock_should_retry(1, -1));
+
+	/* Bounded at 50 ms total; at least two tries. */
+	CHECK_EQ(NVFR_LOCK_RETRY_BUDGET_US, 50000);
+	CHECK(NVFR_LOCK_MAX_ATTEMPTS >= 2);
+	CHECK(NVFR_LOCK_MAX_ATTEMPTS <= 100);
+
+	/* The name shows in /proc/iomem while a transaction runs. */
+	CHECK_EQ(strcmp(NVFR_MAILBOX_LOCK_NAME, "nvfan-mailbox"), 0);
+}
+
 int main(void)
 {
 	test_le16();
@@ -316,6 +348,7 @@ int main(void)
 	test_send_retry_policy();
 	test_owner_allowed();
 	test_cache_fresh();
+	test_lock_retry_policy();
 
 	if (g_failures == 0) {
 		printf("ok - %d checks passed\n", g_checks);

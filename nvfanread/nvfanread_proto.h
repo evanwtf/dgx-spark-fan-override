@@ -208,14 +208,45 @@ static inline int nvfr_send_should_retry(int ret, unsigned int attempts,
 }
 
 /*
+ * Cross-module mailbox lock. nvfanread and nvfancontrol each take the shared
+ * page as a busy iomem region (request_mem_region) for one whole transaction:
+ * snapshot, frame write, doorbell, reply, restore. The page sits inside a
+ * non-busy "reserved" firmware region, so the first request nests under it
+ * and a second request for the same page fails until the first is released.
+ * The address and size must match ESPI_NS_SHM_PA/ESPI_NS_SHM_SIZE in
+ * nvfancontrol.c; scripts/lint.sh checks this.
+ *
+ * A busy region is retried for at most NVFR_LOCK_RETRY_BUDGET_US, with a
+ * sleep between tries and an attempt cap, then the caller returns -EBUSY.
+ */
+#define NVFR_MAILBOX_LOCK_NAME      "nvfan-mailbox"
+#define NVFR_LOCK_RETRY_BUDGET_US   50000LL
+#define NVFR_LOCK_MAX_ATTEMPTS      50U
+
+/*
+ * Return 1 if the caller should try the region again. @attempts is the number
+ * of tries made so far (1 after the first), @elapsed_us the time since the
+ * first try.
+ */
+static inline int nvfr_lock_should_retry(unsigned int attempts,
+					 long long elapsed_us)
+{
+	return attempts < NVFR_LOCK_MAX_ATTEMPTS &&
+	       elapsed_us >= 0 &&
+	       elapsed_us < NVFR_LOCK_RETRY_BUDGET_US;
+}
+
+/*
  * Driver names allowed to own the FF-A device while nvfanread uses the shared
- * page. The page has no lock; binding the device is the only exclusion.
+ * page. The mailbox lock above excludes nvfancontrol 1.1.0 and later; this
+ * check also refuses drivers that write the page without the lock.
  *   NULL           - unbound (nvfanread's own driver lost the race or was
  *                    unbound; nothing else is writing the page)
  *   nvidia-ffa-ec  - the built-in driver on 7.0.0-1025+; it forwards ACPI FFH
  *                    requests in registers and never uses the page
  *   nvfanread      - our own claim driver (6.17 / 7.0.0-1019)
- * Anything else (nvfancontrol, ec-probe's nvfanprobe) writes the page itself.
+ * Anything else writes the page without the lock: nvfancontrol 1.0.0 (it
+ * binds; later versions never bind) and ec-probe's nvfanprobe.
  */
 #define NVFR_DRIVER_NAME            "nvfanread"
 #define NVFR_NVIDIA_EC_DRIVER_NAME  "nvidia-ffa-ec"

@@ -15,11 +15,14 @@
  * looks the device up on the bus and sends through its ops without owning it.
  * See issue #15.
  *
- * The shared page has no lock; binding the device is the only exclusion
- * between nvfanread, nvfancontrol and ec-probe. So nvfanread also registers a
- * small claim driver: where the device is free (6.17, 7.0.0-1019) it binds,
- * as 1.0.0 did. Each read also checks the current owner and refuses with
- * -EBUSY if a driver that writes the page holds the device.
+ * On 7.0.0-1025+ neither nvfanread nor nvfancontrol can bind the device, so
+ * binding cannot keep them off the shared page at the same time. Each
+ * transaction therefore takes the page as a busy iomem region
+ * (NVFR_MAILBOX_LOCK_NAME), and nvfancontrol 1.1.0+ does the same. nvfanread
+ * also keeps a small claim driver: where the device is free (6.17,
+ * 7.0.0-1019) it binds, as 1.0.0 did. Each read also checks the current owner
+ * and refuses with -EBUSY if a driver that writes the page without the lock
+ * (nvfancontrol 1.0.0, ec-probe) holds the device.
  *
  * Reading fan RPM issues a single OEM1 command 17 carrying EC inner command 7
  * ("thermal control / fan operation telemetry snapshot"), which the EC
@@ -29,9 +32,9 @@
  *
  * The pure protocol logic lives in nvfanread_proto.h and is unit-tested in
  * userspace; this file adds the FF-A / shared-page I/O around it. The mailbox
- * handshake mirrors the override driver: it refuses a non-idle mailbox,
- * snapshots the shared page, and restores it afterwards. Requests are
- * serialized under a mutex.
+ * handshake mirrors the override driver: it takes the mailbox lock, refuses a
+ * non-idle mailbox, snapshots the shared page, restores it afterwards, and
+ * releases the lock. Requests in this module are serialized under a mutex.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -43,6 +46,7 @@
 #include <linux/errno.h>
 #include <linux/hwmon.h>
 #include <linux/io.h>
+#include <linux/ioport.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/mm.h>
@@ -126,9 +130,43 @@ static int send_doorbell(struct ffa_device *fdev, struct ffa_send_direct_data2 *
 }
 
 /*
- * The shared page has no lock: binding the FF-A device is the only exclusion
- * between nvfanread, nvfancontrol and ec-probe. Refuse to touch the page while
- * any driver that writes it owns the device. nvidia-ffa-ec never uses the page.
+ * Take the shared page as a busy iomem region for one transaction. This is the
+ * lock between nvfanread and nvfancontrol: both request the same region, and
+ * the kernel grants it to one caller at a time. Retry a busy region inside the
+ * bounds in nvfanread_proto.h, then give up with -EBUSY. Never hold it across
+ * module lifetime, or the other module could never send.
+ */
+static int mailbox_lock(void)
+{
+	ktime_t start = ktime_get();
+	unsigned int attempts = 0;
+
+	for (;;) {
+		if (request_mem_region(ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE,
+				       NVFR_MAILBOX_LOCK_NAME))
+			return 0;
+		attempts++;
+		if (!nvfr_lock_should_retry(attempts,
+					    ktime_us_delta(ktime_get(), start)))
+			break;
+		usleep_range(1000, 2000);
+	}
+
+	pr_warn_ratelimited("mailbox lock %#llx busy after %u tries; not sending\n",
+			    ESPI_NS_SHM_PA, attempts);
+	return -EBUSY;
+}
+
+static void mailbox_unlock(void)
+{
+	release_mem_region(ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE);
+}
+
+/*
+ * The mailbox lock keeps nvfancontrol 1.1.0+ off the page. Drivers that write
+ * the page without the lock (nvfancontrol 1.0.0, ec-probe) bind the device, so
+ * refuse to touch the page while one of them owns it. nvidia-ffa-ec never uses
+ * the page.
  */
 static int check_owner(struct ffa_device *fdev)
 {
@@ -182,10 +220,15 @@ static int read_telemetry(struct nvfanread_state *state,
 		return -EPERM;
 	}
 
+	ret = mailbox_lock();
+	if (ret)
+		return ret;
+
 	shm = memremap(ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE, MEMREMAP_WB);
 	if (!shm) {
 		pr_err("memremap of manifest ns_shm0 failed\n");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out_unlock;
 	}
 
 	memcpy(snapshot, shm, sizeof(snapshot));
@@ -261,6 +304,8 @@ static int read_telemetry(struct nvfanread_state *state,
 
 out_unmap:
 	memunmap(shm);
+out_unlock:
+	mailbox_unlock();
 	return ret;
 }
 
@@ -427,8 +472,9 @@ static int nvfanread_match_espi(struct device *dev, const void *data)
 
 /*
  * Claim driver. Where nothing else binds the eSPI service (6.17, 7.0.0-1019)
- * it binds the device so nvfancontrol and ec-probe cannot bind and write the
- * shared page while nvfanread uses it, as 1.0.0 did. On 7.0.0-1025+
+ * it binds the device so drivers that bind and write the shared page without
+ * the mailbox lock (nvfancontrol 1.0.0, ec-probe) cannot attach while
+ * nvfanread uses it, as 1.0.0 did. On 7.0.0-1025+
  * nvidia-ffa-ec already holds the device and this never probes. It keeps no
  * state on the device; the hwmon device does not depend on it.
  */
