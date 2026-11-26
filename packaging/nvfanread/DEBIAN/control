@@ -1,5 +1,5 @@
 Package: nvfanread
-Version: 1.1.0
+Version: 0.0.0
 Priority: optional
 Architecture: arm64
 Maintainer: Evan Hoffman <evandhoffman@gmail.com>

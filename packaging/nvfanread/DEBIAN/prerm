@@ -3,7 +3,7 @@ set -eu
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 module=nvfanread
-version=1.1.0
+version=0.0.0
 
 case "${1:-}" in
 	remove|upgrade|deconfigure)

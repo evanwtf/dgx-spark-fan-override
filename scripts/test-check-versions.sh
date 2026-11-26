@@ -1,6 +1,6 @@
 #!/bin/sh
 # Tests for scripts/check-versions.sh. It must pass on the real tree and fail
-# when any one declaration differs or is missing.
+# when any one declaration differs from the placeholder or is missing.
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -11,7 +11,9 @@ fails=0
 files="packaging/nvfanread/DEBIAN/control nvfanread/dkms.conf \
 	packaging/nvfanread/DEBIAN/postinst packaging/nvfanread/DEBIAN/prerm \
 	scripts/build-nvfanread-deb.sh nvfanread/nvfanread.c \
-	nvfanread/README.md docs/STATUS.md"
+	nvfancontrol/DEBIAN/control nvfancontrol/DEBIAN/postinst \
+	nvfancontrol/DEBIAN/prerm nvfancontrol/DEBIAN/postrm \
+	nvfancontrol/usr/src/nvfancontrol/dkms.conf scripts/build-debs.sh"
 
 fresh_copy() {
 	dir="$(mktemp -d)"
@@ -33,35 +35,48 @@ expect() {
 	fi
 }
 
-expect pass "real tree is consistent" "$repo"
+expect pass "real tree has the placeholder everywhere" "$repo"
 
 # One mutation per declaration: each must make the check fail.
-for case in control dkms postinst prerm build module readme status; do
+for case in control dkms postinst prerm build module \
+	    nfc-control nfc-postinst nfc-prerm nfc-postrm nfc-dkms nfc-build; do
 	dir="$(fresh_copy)"
 	case "$case" in
 	control) sed -i 's/^Version: .*/Version: 9.9.9/' "$dir/packaging/nvfanread/DEBIAN/control" ;;
 	dkms) sed -i 's/^PACKAGE_VERSION=.*/PACKAGE_VERSION="9.9.9"/' "$dir/nvfanread/dkms.conf" ;;
 	postinst) sed -i 's/^version=.*/version=9.9.9/' "$dir/packaging/nvfanread/DEBIAN/postinst" ;;
 	prerm) sed -i 's/^version=.*/version=9.9.9/' "$dir/packaging/nvfanread/DEBIAN/prerm" ;;
-	build) sed -i 's/^ver=.*/ver=9.9.9/' "$dir/scripts/build-nvfanread-deb.sh" ;;
+	build) sed -i 's/^ver=.*/ver="${1:-9.9.9}"/' "$dir/scripts/build-nvfanread-deb.sh" ;;
 	module) sed -i 's/^MODULE_VERSION(.*/MODULE_VERSION("9.9.9");/' "$dir/nvfanread/nvfanread.c" ;;
-	readme) sed -i 's/nvfanread_[0-9.]*_arm64\.deb/nvfanread_9.9.9_arm64.deb/' "$dir/nvfanread/README.md" ;;
-	status) sed -i 's/nvfanread_[0-9.]*_arm64\.deb/nvfanread_9.9.9_arm64.deb/' "$dir/docs/STATUS.md" ;;
+	nfc-control) sed -i 's/^Version: .*/Version: 9.9.9/' "$dir/nvfancontrol/DEBIAN/control" ;;
+	nfc-postinst) sed -i "s/^module_version=.*/module_version='9.9.9'/" "$dir/nvfancontrol/DEBIAN/postinst" ;;
+	nfc-prerm) sed -i "s/^module_version=.*/module_version='9.9.9'/" "$dir/nvfancontrol/DEBIAN/prerm" ;;
+	nfc-postrm) sed -i "s/^module_version=.*/module_version='9.9.9'/" "$dir/nvfancontrol/DEBIAN/postrm" ;;
+	nfc-dkms) sed -i 's/^PACKAGE_VERSION=.*/PACKAGE_VERSION="9.9.9"/' "$dir/nvfancontrol/usr/src/nvfancontrol/dkms.conf" ;;
+	nfc-build) sed -i 's/^ver=.*/ver="${1:-9.9.9}"/' "$dir/scripts/build-debs.sh" ;;
 	esac
-	expect fail "mismatch in $case is caught" "$dir"
+	expect fail "non-placeholder in $case is caught" "$dir"
 	rm -rf "$dir"
 done
 
-# A doc that drops the versioned .deb line must fail, not pass silently.
+# All declarations equal but not the placeholder (a hand bump of every file)
+# must still fail: the tag is the only source of the released version.
 dir="$(fresh_copy)"
-sed -i '/nvfanread_[0-9.]*_arm64\.deb/d' "$dir/docs/STATUS.md"
-expect fail "missing .deb line in STATUS.md is caught" "$dir"
+for f in $files; do
+	sed -i 's/0\.0\.0/1.2.3/g' "$dir/$f"
+done
+expect fail "a consistent hand bump is caught" "$dir"
 rm -rf "$dir"
 
 # A missing declaration must fail, not pass silently.
 dir="$(fresh_copy)"
 sed -i '/^MODULE_VERSION/d' "$dir/nvfanread/nvfanread.c"
 expect fail "missing MODULE_VERSION is caught" "$dir"
+rm -rf "$dir"
+
+dir="$(fresh_copy)"
+sed -i '/^module_version=/d' "$dir/nvfancontrol/DEBIAN/postrm"
+expect fail "missing nvfancontrol postrm module_version is caught" "$dir"
 rm -rf "$dir"
 
 if [ "$fails" -eq 0 ]; then
