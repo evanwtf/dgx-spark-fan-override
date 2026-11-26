@@ -34,6 +34,7 @@ check packaging/nvfanread/DEBIAN/postinst 's/^version=//p'
 check packaging/nvfanread/DEBIAN/prerm 's/^version=//p'
 check nvfanread/dkms.conf 's/^PACKAGE_VERSION="\(.*\)"$/\1/p'
 check nvfanread/nvfanread.c 's/^MODULE_VERSION("\(.*\)");$/\1/p'
+# shellcheck disable=SC2016  # a literal ${1:-...} in a sed pattern, not an expansion
 check scripts/build-nvfanread-deb.sh 's/^ver="\${1:-\(.*\)}"$/\1/p'
 
 # nvfancontrol
@@ -42,6 +43,7 @@ check nvfancontrol/DEBIAN/postinst "s/^module_version='\\(.*\\)'\$/\\1/p"
 check nvfancontrol/DEBIAN/prerm "s/^module_version='\\(.*\\)'\$/\\1/p"
 check nvfancontrol/DEBIAN/postrm "s/^module_version='\\(.*\\)'\$/\\1/p"
 check nvfancontrol/usr/src/nvfancontrol/dkms.conf 's/^PACKAGE_VERSION="\(.*\)"$/\1/p'
+# shellcheck disable=SC2016  # a literal ${1:-...} in a sed pattern, not an expansion
 check scripts/build-debs.sh 's/^ver="\${1:-\(.*\)}"$/\1/p'
 
 if [ "$status" -eq 0 ]; then
