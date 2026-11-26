@@ -41,7 +41,7 @@ remove_manual_modules() {
 
 case "${1:-}" in
     remove|upgrade|deconfigure)
-        exec 9>/run/lock/nvfancontrol.lock
+        exec 9>/run/nvfancontrol.lock
         flock 9
 
         if grep -q "^${module} " /proc/modules 2>/dev/null; then

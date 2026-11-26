@@ -47,7 +47,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-exec 9>/run/lock/nvfancontrol.lock
+exec 9>/run/nvfancontrol.lock
 if ! flock -n 9; then
     printf 'Another nvfancontrol operation is already running.\n' >&2
     exit 1
@@ -141,11 +141,27 @@ if [ ! -w "$fan_path" ]; then
     exit 1
 fi
 
-if ! printf '%s\n' "$action" > "$fan_path"; then
+# "error -11" (EAGAIN) means the module sent nothing to the EC: the mailbox
+# was busy or a check refused the request. That is safe to retry. Any other
+# error means the request may have reached the EC.
+tries=0
+while ! printf '%s\n' "$action" > "$fan_path"; do
+    state="$(tr -d '\r\n' < "$fan_path")"
+    tries=$((tries + 1))
+    if [ "$state" = 'error -11' ]; then
+        if [ "$tries" -le 3 ]; then
+            printf 'Mailbox busy; nothing was sent. Retry %s of 3 in 1 s.\n' \
+                "$tries" >&2
+            sleep 1
+            continue
+        fi
+        printf 'Nothing was sent; the EC keeps its previous setting; safe to retry.\n' >&2
+        exit 75
+    fi
     printf 'The sysfs write failed; EC override state is unknown. Do not retry blindly.\n' >&2
-    printf 'Fan state: %s\n' "$(tr -d '\r\n' < "$fan_path")" >&2
+    printf 'Fan state: %s\n' "$state" >&2
     exit 1
-fi
+done
 
 after="$(tr -d '\r\n' < "$fan_path")"
 if [ "$after" != "$action" ]; then
