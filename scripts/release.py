@@ -5,6 +5,7 @@ record of the released version: nothing in the tree carries it, and the build
 scripts stamp it into a staging copy. This CLI decides and describes a release:
 
   plan    decide whether this commit releases, and at which version
+          (a direct push to main, with no PR, publishes nothing)
   notes   write the release notes from the PR's "## Quick summary" section
   verify  check that built .debs report the version, everywhere it is stamped
 
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterable, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -160,39 +162,177 @@ def bump_level(labels: Iterable[str]) -> Level | Literal["skip"]:
     return "patch"
 
 
-def _load_json_object(text: str, what: str) -> dict[str, object]:
+def _load_json(text: str, what: str) -> object:
     try:
-        data = json.loads(text)
+        return json.loads(text)
     except json.JSONDecodeError as e:
         raise ReleaseError(f"{what}: not JSON: {e}") from e
-    if not isinstance(data, dict):
-        raise ReleaseError(f"{what}: want a JSON object, got {type(data).__name__}")
-    return data
 
 
-def labels_from_gh_json(text: str) -> list[str]:
-    """Label names from `gh pr view N --json labels`. Strict: any odd shape
+def _field(obj: object, key: str, what: str) -> object:
+    if not isinstance(obj, dict) or key not in obj:
+        raise ReleaseError(f"{what}: no {key!r} in {obj!r:.200}")
+    return obj[key]
+
+
+def _str_field(obj: object, key: str, what: str) -> str:
+    value = _field(obj, key, what)
+    if not isinstance(value, str):
+        raise ReleaseError(f"{what}: {key!r} is not a string: {value!r:.200}")
+    return value
+
+
+def _opt_time(obj: object, key: str, what: str) -> datetime | None:
+    value = _field(obj, key, what)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ReleaseError(f"{what}: {key!r} is not a time: {value!r}")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as e:
+        raise ReleaseError(f"{what}: {key!r} is not a time: {value!r}") from e
+
+
+# ---- GitHub lookups ---------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class PullRequest:
+    number: int
+    state: str
+    merge_commit: str | None
+    merged_at: datetime | None
+    last_edited_at: datetime | None
+    labels: list[str]
+    body: str
+
+
+# One GraphQL query, so every field comes from the same moment. `gh pr view`
+# does not expose lastEditedAt; GraphQL does.
+_PR_QUERY = """\
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      state
+      body
+      mergedAt
+      lastEditedAt
+      mergeCommit { oid }
+      labels(first: 100) { totalCount nodes { name } }
+    }
+  }
+}"""
+
+
+def pr_from_graphql(text: str) -> PullRequest:
+    """Parse the `gh api graphql` answer to _PR_QUERY. Strict: any odd shape
     raises, so a broken lookup never reads as "no labels"."""
-    data = _load_json_object(text, "gh labels")
-    raw = data.get("labels")
-    if not isinstance(raw, list):
-        raise ReleaseError(f"gh labels: 'labels' is not a list: {raw!r}")
-    names: list[str] = []
-    for item in raw:
-        name = item.get("name") if isinstance(item, dict) else None
-        if not isinstance(name, str):
-            raise ReleaseError(f"gh labels: label without a name: {item!r}")
-        names.append(name)
-    return names
+    what = "gh pull request lookup"
+    data = _load_json(text, what)
+    if isinstance(data, dict) and data.get("errors"):
+        raise ReleaseError(f"{what}: {data['errors']!r:.300}")
+    repo = _field(_field(data, "data", what), "repository", what)
+    pr = _field(repo, "pullRequest", what)
+    if pr is None:
+        raise ReleaseError(f"{what}: no such pull request")
+    number = _field(pr, "number", what)
+    if not isinstance(number, int) or isinstance(number, bool):
+        raise ReleaseError(f"{what}: 'number' is not an int: {number!r}")
+    merge = _field(pr, "mergeCommit", what)
+    merge_commit = None if merge is None else _str_field(merge, "oid", what)
+    labels_obj = _field(pr, "labels", what)
+    total = _field(labels_obj, "totalCount", what)
+    nodes = _field(labels_obj, "nodes", what)
+    if not isinstance(nodes, list) or not isinstance(total, int):
+        raise ReleaseError(f"{what}: bad labels: {labels_obj!r:.200}")
+    if total != len(nodes):
+        raise ReleaseError(f"{what}: {total} labels, only {len(nodes)} read")
+    return PullRequest(
+        number=number,
+        state=_str_field(pr, "state", what),
+        merge_commit=merge_commit,
+        merged_at=_opt_time(pr, "mergedAt", what),
+        last_edited_at=_opt_time(pr, "lastEditedAt", what),
+        labels=[_str_field(n, "name", what) for n in nodes],
+        body=_str_field(pr, "body", what),
+    )
 
 
-def body_from_gh_json(text: str) -> str:
-    """The PR body from `gh pr view N --json body`."""
-    data = _load_json_object(text, "gh body")
-    body = data.get("body")
-    if not isinstance(body, str):
-        raise ReleaseError(f"gh body: 'body' is not a string: {body!r}")
-    return body
+def _split_repo(repo: str) -> tuple[str, str]:
+    owner, _, name = repo.partition("/")
+    if not owner or not name or "/" in name:
+        raise ReleaseError(f"repo must be owner/name, got {repo!r}")
+    return owner, name
+
+
+def fetch_pr(number: int, repo: str, gh: Runner) -> PullRequest:
+    owner, name = _split_repo(repo)
+    args = ["gh", "api", "graphql", "-f", f"query={_PR_QUERY}"]
+    args += ["-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={number}"]
+    try:
+        text = gh(args)
+    except ReleaseError as e:
+        raise ReleaseError(f"lookup of #{number} failed: {e}") from e
+    pr = pr_from_graphql(text)
+    if pr.number != number:
+        raise ReleaseError(f"asked for #{number}, GitHub answered #{pr.number}")
+    return pr
+
+
+def check_merged_as(pr: PullRequest, sha: str) -> None:
+    """The PR must be merged, and its merge commit must be this commit.
+
+    A number in a subject can point at any PR. Only a PR whose merge commit is
+    this commit owns this commit's labels.
+    """
+    if pr.state != "MERGED":
+        raise ReleaseError(f"#{pr.number} is {pr.state}, not MERGED")
+    if pr.merge_commit != sha:
+        raise ReleaseError(
+            f"#{pr.number} merged as {pr.merge_commit}, not as this commit {sha}"
+        )
+
+
+def check_body_not_edited_after_merge(pr: PullRequest) -> None:
+    """Refuse notes from a body edited after the merge: the notes must say
+    what was reviewed and merged."""
+    if pr.last_edited_at is None or pr.merged_at is None:
+        return
+    if pr.last_edited_at > pr.merged_at:
+        raise ReleaseError(
+            f"#{pr.number} body was edited at {pr.last_edited_at.isoformat()}, "
+            f"after the merge at {pr.merged_at.isoformat()}; refusing its notes"
+        )
+
+
+def commit_pulls_from_json(text: str) -> list[tuple[int, str | None]]:
+    """(number, merge_commit_sha) of each PR in the answer to
+    `gh api repos/{repo}/commits/{sha}/pulls`."""
+    what = "gh commit pulls lookup"
+    data = _load_json(text, what)
+    if not isinstance(data, list):
+        raise ReleaseError(f"{what}: want a list, got {data!r:.200}")
+    out: list[tuple[int, str | None]] = []
+    for item in data:
+        number = _field(item, "number", what)
+        merge_sha = _field(item, "merge_commit_sha", what)
+        if not isinstance(number, int) or not (
+            merge_sha is None or isinstance(merge_sha, str)
+        ):
+            raise ReleaseError(f"{what}: bad entry {item!r:.200}")
+        out.append((number, merge_sha))
+    return out
+
+
+def fetch_commit_pulls(sha: str, repo: str, gh: Runner) -> list[tuple[int, str | None]]:
+    _split_repo(repo)
+    try:
+        text = gh(["gh", "api", f"repos/{repo}/commits/{sha}/pulls"])
+    except ReleaseError as e:
+        raise ReleaseError(f"lookup of the PRs for {sha} failed: {e}") from e
+    return commit_pulls_from_json(text)
 
 
 def run_command(args: Sequence[str], cwd: Path | None = None) -> str:
@@ -221,46 +361,34 @@ def gh_runner(args: Sequence[str]) -> str:
     return run_command(args)
 
 
-def fetch_labels(pr: int, repo: str, gh: Runner) -> list[str]:
-    try:
-        text = gh(["gh", "pr", "view", str(pr), "--repo", repo, "--json", "labels"])
-    except ReleaseError as e:
-        raise ReleaseError(f"label lookup for #{pr} failed: {e}") from e
-    return labels_from_gh_json(text)
-
-
-def fetch_body(pr: int, repo: str, gh: Runner) -> str:
-    text = gh(["gh", "pr", "view", str(pr), "--repo", repo, "--json", "body"])
-    return body_from_gh_json(text)
-
-
 # ---- Docs-only changes ------------------------------------------------------
 
 
 def is_docs_only(paths: Sequence[str]) -> bool:
-    """True when every path is under docs/ or is a top-level *.md file.
+    """True when every path is under docs/ or is a *.md file at any depth.
 
+    No .md file ships in either .deb, so a change to one changes no package.
     An empty change set is not docs-only. Workflows and scripts are not docs:
     a merge that changes only them still releases.
     """
     if not paths:
         return False
-    return all(
-        p.startswith("docs/") or ("/" not in p and p.endswith(".md")) for p in paths
-    )
+    return all(p.startswith("docs/") or p.endswith(".md") for p in paths)
 
 
 # ---- Release notes ----------------------------------------------------------
 
 _SUMMARY_HEADING = "## Quick summary"
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 
 
 def quick_summary(body: str) -> str:
-    """The text under '## Quick summary', up to the next '## ' heading.
+    """The text under '## Quick summary', up to the next level-1 or level-2
+    heading ('# ' or '## ').
 
-    A '## ' line inside a fenced code block does not end the section. The text
-    is returned exactly as written (CRLF normalized to LF), so backticks and
-    shell syntax survive unchanged.
+    A heading inside a fenced code block (``` or ~~~) does not end the
+    section. The text is returned exactly as written (CRLF normalized to LF),
+    so backticks and shell syntax survive unchanged.
     """
     lines = body.replace("\r\n", "\n").split("\n")
     start = None
@@ -271,11 +399,16 @@ def quick_summary(body: str) -> str:
     if start is None:
         raise ReleaseError(f"PR body has no '{_SUMMARY_HEADING}' section")
     section: list[str] = []
-    in_fence = False
+    fence: str | None = None  # the opening fence while inside a code block
     for line in lines[start:]:
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-        elif not in_fence and line.startswith("## "):
+        m = _FENCE_RE.match(line)
+        if fence is None and m is not None:
+            fence = m[1]
+        elif fence is not None:
+            # A fence closes on the same character, at least as long.
+            if m is not None and m[1][0] == fence[0] and len(m[1]) >= len(fence):
+                fence = None
+        elif line.startswith(("# ", "## ")) or line.rstrip() in ("#", "##"):
             break
         section.append(line)
     text = "\n".join(section).strip("\n").rstrip()
@@ -287,14 +420,6 @@ def quick_summary(body: str) -> str:
 def release_notes(body: str, pr: int, repo: str) -> str:
     summary = quick_summary(body)
     return f"{summary}\n\nPull request: https://github.com/{repo}/pull/{pr}\n"
-
-
-def commit_notes(message: str, sha: str, repo: str) -> str:
-    """Notes for a direct push to main, which has no PR: the commit message."""
-    text = message.replace("\r\n", "\n").strip()
-    if not text:
-        raise ReleaseError(f"commit {sha} has an empty message")
-    return f"{text}\n\nCommit: https://github.com/{repo}/commit/{sha}\n"
 
 
 # ---- Plan -------------------------------------------------------------------
@@ -309,11 +434,7 @@ class Plan:
     reused: bool = False
 
 
-def _changed_paths(sha: str, parents: list[str], git: Runner) -> list[str]:
-    if parents:
-        out = git(["diff", "--name-only", "-z", parents[0], sha])
-    else:
-        out = git(["ls-tree", "-r", "--name-only", "-z", sha])
+def _paths(out: str) -> list[str]:
     return [p for p in out.split("\0") if p]
 
 
@@ -323,15 +444,22 @@ def make_plan(sha: str, repo: str, git: Runner, gh: Runner) -> Plan:
     Order matters:
     1. A vX.Y.Z tag already on this commit means an earlier run got that far:
        reuse it and finish publishing. Never bump twice.
-    2. Read the PR number from the commit, then its labels (fail closed).
-    3. skip-release or a docs-only change publishes nothing.
-    4. Otherwise bump the highest vX.Y.Z tag by the label's level.
+    2. The highest vX.Y.Z tag must be an ancestor of this commit. A rerun of
+       an old merge must not publish a higher version on older code.
+    3. Find the PR from the commit subject. It must be merged as this commit.
+       No PR (a direct push) publishes nothing. A missing (#N) on a commit
+       that GitHub says a PR merged fails: the squash title was edited.
+    4. skip-release, or a docs-only change since the highest tag, publishes
+       nothing.
+    5. Otherwise bump the highest vX.Y.Z tag by the label's level.
     """
     full = git(["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"]).strip()
     parents = git(["rev-list", "--parents", "-n", "1", full]).split()[1:]
     subject = git(["log", "-1", "--format=%s", full]).strip()
-    pr = pr_number_from_commit(subject, len(parents))
-    logger.info("commit %s, parents %d, PR %s", full[:12], len(parents), pr or "none")
+    pr_number = pr_number_from_commit(subject, len(parents))
+    logger.info(
+        "commit %s, parents %d, PR %s", full[:12], len(parents), pr_number or "none"
+    )
 
     here = [
         v
@@ -348,25 +476,62 @@ def make_plan(sha: str, repo: str, git: Runner, gh: Runner) -> Plan:
     if here:
         version = here[0]
         logger.info("%s already points at this commit: rerun, reusing it", version.tag)
-        return Plan(True, f"rerun: reusing {version.tag}", version, pr, reused=True)
-
-    labels: list[str] = []
-    if pr is not None:
-        labels = fetch_labels(pr, repo, gh)
-    logger.info("labels: %s", ", ".join(labels) or "none")
-    level = bump_level(labels)
-    if level == "skip":
-        return Plan(False, f"labelled {SKIP_LABEL}", pr=pr)
-
-    paths = _changed_paths(full, parents, git)
-    if is_docs_only(paths):
-        return Plan(False, "docs-only change", pr=pr)
+        return Plan(
+            True, f"rerun: reusing {version.tag}", version, pr_number, reused=True
+        )
 
     tags = git(["tag", "--list", "v*"]).split()
-    version = next_version(tags, level)
     latest = latest_version(tags)
-    base = latest.tag if latest else f"{BASE_VERSION} (no tags yet)"
-    return Plan(True, f"{level} bump from {base}", version, pr)
+    if latest is not None:
+        tagged = git(["rev-parse", f"{latest.tag}^{{commit}}"]).strip()
+        base = git(["merge-base", tagged, full]).strip()
+        if base != tagged:
+            raise ReleaseError(
+                f"{latest.tag} is not an ancestor of {full[:12]}: this commit is "
+                f"older than the latest release (or off its line); refusing to "
+                f"publish a version above {latest} on it"
+            )
+
+    if pr_number is None:
+        for number, merge_sha in fetch_commit_pulls(full, repo, gh):
+            if merge_sha == full:
+                raise ReleaseError(
+                    f"#{number} merged as {full[:12]}, but the subject has no "
+                    f"'(#{number})': the squash title was edited at merge time; "
+                    "refusing to guess its release labels"
+                )
+        return Plan(
+            False,
+            "direct push to main, not a PR merge; its change ships with the "
+            "next PR merge",
+        )
+
+    pr = fetch_pr(pr_number, repo, gh)
+    check_merged_as(pr, full)
+    logger.info("labels: %s", ", ".join(pr.labels) or "none")
+    level = bump_level(pr.labels)
+    if level == "skip":
+        return Plan(False, f"labelled {SKIP_LABEL}", pr=pr_number)
+
+    # With a tag, judge everything since it: a code merge whose run was
+    # cancelled still ships with the next merge, even a docs-only one.
+    if latest is not None:
+        since = latest.tag
+        paths = _paths(git(["diff", "--name-only", "--no-renames", "-z", since, full]))
+    elif parents:
+        since = parents[0][:12]
+        paths = _paths(
+            git(["diff", "--name-only", "--no-renames", "-z", parents[0], full])
+        )
+    else:
+        since = "the root"
+        paths = _paths(git(["ls-tree", "-r", "--name-only", "-z", full]))
+    if is_docs_only(paths):
+        return Plan(False, f"docs-only change since {since}", pr=pr_number)
+
+    version = next_version(tags, level)
+    base_text = latest.tag if latest else f"{BASE_VERSION} (no tags yet)"
+    return Plan(True, f"{level} bump from {base_text}", version, pr_number)
 
 
 # ---- Verify built artifacts -------------------------------------------------
@@ -378,7 +543,7 @@ _DECLARATIONS: dict[str, list[tuple[str, str]]] = {
         ("DEBIAN/postinst", r"^version=(.*)$"),
         ("DEBIAN/prerm", r"^version=(.*)$"),
         ("usr/src/nvfanread-{v}/dkms.conf", r'^PACKAGE_VERSION="(.*)"$'),
-        ("usr/src/nvfanread-{v}/nvfanread.c", r'^MODULE_VERSION\("(.*)"\);$'),
+        ("usr/src/nvfanread-{v}/nvfanread.c", r'MODULE_VERSION\("([^"]*)"\)'),
     ],
     "nvfancontrol": [
         ("DEBIAN/postinst", r"^module_version='(.*)'$"),
@@ -387,6 +552,8 @@ _DECLARATIONS: dict[str, list[tuple[str, str]]] = {
         ("usr/src/nvfancontrol/dkms.conf", r'^PACKAGE_VERSION="(.*)"$'),
     ],
 }
+# Any MODULE_VERSION in any shipped .c file must also carry the version.
+_MODULE_VERSION_RE = re.compile(r'MODULE_VERSION\("([^"]*)"\)')
 
 
 def _check_tree(package: str, tree: Path, version: Version) -> list[str]:
@@ -403,6 +570,13 @@ def _check_tree(package: str, tree: Path, version: Version) -> list[str]:
         for value in found:
             if value != str(version):
                 problems.append(f"{package}: {member} has {value}, want {version}")
+    for path in sorted(tree.rglob("*.c")):
+        member = path.relative_to(tree).as_posix()
+        for value in _MODULE_VERSION_RE.findall(path.read_text(errors="replace")):
+            if value != str(version):
+                problems.append(
+                    f"{package}: {member} has MODULE_VERSION {value}, want {version}"
+                )
     return problems
 
 
@@ -441,15 +615,28 @@ def _append(path: str | None, text: str) -> None:
             f.write(text)
 
 
+def _gh_from_files(pr_json: str | None, pulls_json: str | None) -> Runner:
+    """A gh stand-in for dry runs: answers from saved `gh api` output files,
+    and fails any lookup it has no file for."""
+
+    def run(args: Sequence[str]) -> str:
+        if list(args[1:3]) == ["api", "graphql"] and pr_json:
+            return Path(pr_json).read_text()
+        if (
+            list(args[1:2]) == ["api"]
+            and str(args[2]).endswith("/pulls")
+            and pulls_json
+        ):
+            return Path(pulls_json).read_text()
+        raise ReleaseError(f"dry run: no saved answer for {' '.join(args[:3])}")
+
+    return run
+
+
 def _cmd_plan(args: argparse.Namespace) -> None:
     gh: Runner = gh_runner
-    if args.labels_json:
-        labels_text = Path(args.labels_json).read_text()
-
-        def gh_from_file(cmd: Sequence[str]) -> str:
-            return labels_text
-
-        gh = gh_from_file
+    if args.pr_json or args.pulls_json:
+        gh = _gh_from_files(args.pr_json, args.pulls_json)
     p = make_plan(args.rev, args.repo, git=git_runner(), gh=gh)
     if p.release:
         assert p.version is not None
@@ -469,18 +656,14 @@ def _cmd_plan(args: argparse.Namespace) -> None:
 
 
 def _cmd_notes(args: argparse.Namespace) -> None:
-    if args.pr is not None:
-        if args.pr_json:
-            body = body_from_gh_json(Path(args.pr_json).read_text())
-        else:
-            body = fetch_body(args.pr, args.repo, gh_runner)
-        notes = release_notes(body, args.pr, args.repo)
-    elif args.rev:
-        message = git_runner()(["log", "-1", "--format=%B", args.rev])
-        sha = git_runner()(["rev-parse", args.rev]).strip()
-        notes = commit_notes(message, sha, args.repo)
-    else:
-        raise ReleaseError("notes: give --pr, or --rev for a direct push")
+    gh: Runner = gh_runner
+    if args.pr_json:
+        gh = _gh_from_files(args.pr_json, None)
+    sha = git_runner()(["rev-parse", "--verify", f"{args.rev}^{{commit}}"]).strip()
+    pr = fetch_pr(args.pr, args.repo, gh)
+    check_merged_as(pr, sha)
+    check_body_not_edited_after_merge(pr)
+    notes = release_notes(pr.body, args.pr, args.repo)
     Path(args.out).write_text(notes, encoding="utf-8")
     logger.info("wrote %d bytes of notes to %s", len(notes.encode()), args.out)
 
@@ -499,25 +682,29 @@ def _parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("plan", help="decide whether a commit releases, and its version")
     p.add_argument("--rev", required=True, help="the commit (e.g. $GITHUB_SHA)")
-    p.add_argument("--repo", required=True, help="owner/name for the gh lookup")
+    p.add_argument("--repo", required=True, help="owner/name for the gh lookups")
     p.add_argument(
-        "--labels-json",
-        help="read `gh pr view N --json labels` output from this file instead of "
-        "calling gh (dry runs and tests)",
+        "--pr-json",
+        help="dry run: answer the PR lookup from this saved `gh api graphql` "
+        "output instead of calling gh",
+    )
+    p.add_argument(
+        "--pulls-json",
+        help="dry run: answer the commit-to-PR lookup from this saved "
+        "`gh api repos/O/R/commits/SHA/pulls` output",
     )
     p.add_argument("--github-output", help="append key=value outputs to this file")
     p.add_argument("--step-summary", help="append a one-line summary to this file")
     p.set_defaults(func=_cmd_plan)
 
     n = sub.add_parser("notes", help="write release notes from the PR's Quick summary")
-    n.add_argument("--repo", required=True, help="owner/name, for the PR link")
-    n.add_argument("--pr", type=int, help="the PR number (from `plan`)")
+    n.add_argument("--repo", required=True, help="owner/name, for the lookup and link")
+    n.add_argument("--pr", type=int, required=True, help="the PR number (from plan)")
+    n.add_argument("--rev", required=True, help="the commit the PR merged as")
     n.add_argument(
         "--pr-json",
-        help="read `gh pr view N --json body` output from this file instead of "
-        "calling gh",
+        help="dry run: answer the PR lookup from this saved `gh api graphql` output",
     )
-    n.add_argument("--rev", help="for a direct push (no PR): use this commit's message")
     n.add_argument("--out", required=True, help="write the notes to this file")
     n.set_defaults(func=_cmd_notes)
 

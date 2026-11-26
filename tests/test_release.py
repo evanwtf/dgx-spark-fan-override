@@ -7,6 +7,7 @@ negative: the job is to refuse correctly, never to guess.
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -93,26 +94,61 @@ class TestBumpLevel:
         assert release.bump_level(["semver:Major", "skip-release-not"]) == "patch"
 
 
-class TestLabelsFromGhJson:
-    def test_real_shape_no_labels(self) -> None:
-        text = (FIXTURES / "pr17.json").read_text()
-        assert release.labels_from_gh_json(text) == []
+# ---- The PR lookup ----------------------------------------------------------
 
-    def test_real_shape_with_a_label(self) -> None:
-        # Shape copied from `gh pr view 76 -R evanwtf/monitor --json labels`.
-        text = json.dumps(
-            {
-                "labels": [
-                    {
-                        "color": "5319E7",
-                        "description": "Merging this publishes no release",
-                        "id": "LA_kwDOT1I5MM8AAAACwVacCg",
-                        "name": "skip-release",
+PR17_SHA = "15de9575d462ee8979014c877ff479ede84cbfca"
+
+
+def graphql(
+    number: int = 17,
+    state: str = "MERGED",
+    merge_oid: str | None = PR17_SHA,
+    merged_at: str | None = "2026-11-26T03:23:29Z",
+    last_edited_at: str | None = None,
+    labels: Sequence[str] = (),
+    body: str = "## Quick summary\n\nThe change.\n",
+) -> str:
+    """An answer to release._PR_QUERY, in the shape of the real one for #17
+    (tests/fixtures/pr17_graphql.json)."""
+    return json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "number": number,
+                        "state": state,
+                        "body": body,
+                        "mergedAt": merged_at,
+                        "lastEditedAt": last_edited_at,
+                        "mergeCommit": None
+                        if merge_oid is None
+                        else {"oid": merge_oid},
+                        "labels": {
+                            "totalCount": len(labels),
+                            "nodes": [{"name": n} for n in labels],
+                        },
                     }
-                ]
+                }
             }
-        )
-        assert release.labels_from_gh_json(text) == ["skip-release"]
+        }
+    )
+
+
+class TestPrLookup:
+    def test_real_pr17_shape(self) -> None:
+        pr = release.pr_from_graphql((FIXTURES / "pr17_graphql.json").read_text())
+        assert pr.number == 17
+        assert pr.state == "MERGED"
+        assert pr.merge_commit == PR17_SHA
+        assert pr.labels == []
+        assert pr.last_edited_at is None
+        assert pr.body.startswith("## Quick summary")
+        release.check_merged_as(pr, PR17_SHA)
+        release.check_body_not_edited_after_merge(pr)
+
+    def test_labels_are_read(self) -> None:
+        pr = release.pr_from_graphql(graphql(labels=["semver:minor", "bug"]))
+        assert pr.labels == ["semver:minor", "bug"]
 
     @pytest.mark.parametrize(
         "text",
@@ -121,33 +157,88 @@ class TestLabelsFromGhJson:
             "not json",
             "[]",
             "{}",
-            '{"labels": null}',
-            '{"labels": "semver:major"}',
-            '{"labels": [{"id": "x"}]}',
-            '{"labels": [{"name": 3}]}',
-            '{"labels": ["semver:major"]}',
+            '{"data": null}',
+            '{"data": {"repository": null}}',
+            '{"data": {"repository": {"pullRequest": null}}}',
+            '{"errors": [{"message": "Bad credentials"}]}',
         ],
     )
     def test_malformed_is_refused(self, text: str) -> None:
         with pytest.raises(ReleaseError):
-            release.labels_from_gh_json(text)
+            release.pr_from_graphql(text)
+
+    def test_label_without_name_is_refused(self) -> None:
+        text = graphql(labels=["semver:minor"]).replace('"name"', '"nom"')
+        with pytest.raises(ReleaseError):
+            release.pr_from_graphql(text)
+
+    def test_unread_labels_are_refused(self) -> None:
+        text = graphql(labels=["semver:minor"]).replace(
+            '"totalCount": 1', '"totalCount": 101'
+        )
+        with pytest.raises(ReleaseError, match="101 labels"):
+            release.pr_from_graphql(text)
 
     def test_failed_lookup_fails_the_release(self) -> None:
         def broken(args: Sequence[str]) -> str:
             raise ReleaseError("gh: HTTP 403")
 
         with pytest.raises(ReleaseError, match="403"):
-            release.fetch_labels(17, REPO, broken)
+            release.fetch_pr(17, REPO, broken)
 
-    def test_lookup_passes_number_and_repo_as_arguments(self) -> None:
+    def test_lookup_passes_values_as_arguments(self) -> None:
         seen: list[Sequence[str]] = []
 
         def fake(args: Sequence[str]) -> str:
             seen.append(args)
-            return '{"labels": [{"name": "semver:minor"}]}'
+            return graphql()
 
-        assert release.fetch_labels(17, REPO, fake) == ["semver:minor"]
-        assert seen == [["gh", "pr", "view", "17", "--repo", REPO, "--json", "labels"]]
+        release.fetch_pr(17, REPO, fake)
+        (args,) = seen
+        assert list(args[:3]) == ["gh", "api", "graphql"]
+        assert "owner=evanwtf" in args
+        assert "name=dgx-spark-fan-override" in args
+        assert "number=17" in args
+
+    def test_wrong_number_in_answer_is_refused(self) -> None:
+        with pytest.raises(ReleaseError, match="#18"):
+            release.fetch_pr(17, REPO, lambda args: graphql(number=18))
+
+    def test_not_merged_is_refused(self) -> None:
+        pr = release.pr_from_graphql(graphql(state="OPEN", merge_oid=None))
+        with pytest.raises(ReleaseError, match="OPEN"):
+            release.check_merged_as(pr, PR17_SHA)
+
+    def test_other_merge_commit_is_refused(self) -> None:
+        pr = release.pr_from_graphql(graphql(merge_oid="a" * 40))
+        with pytest.raises(ReleaseError, match="not as this commit"):
+            release.check_merged_as(pr, PR17_SHA)
+
+    def test_body_edited_after_merge_is_refused(self) -> None:
+        pr = release.pr_from_graphql(graphql(last_edited_at="2026-11-26T03:24:00Z"))
+        with pytest.raises(ReleaseError, match="after the merge"):
+            release.check_body_not_edited_after_merge(pr)
+
+    def test_body_edited_before_merge_is_fine(self) -> None:
+        pr = release.pr_from_graphql(graphql(last_edited_at="2026-11-26T03:00:00Z"))
+        release.check_body_not_edited_after_merge(pr)
+
+    def test_bad_time_is_refused(self) -> None:
+        with pytest.raises(ReleaseError):
+            release.pr_from_graphql(graphql(last_edited_at="yesterday"))
+
+    def test_commit_pulls_real_shape(self) -> None:
+        text = (FIXTURES / "pulls_15de957.json").read_text()
+        assert release.commit_pulls_from_json(text) == [(17, PR17_SHA)]
+        assert release.commit_pulls_from_json("[]") == []
+
+    @pytest.mark.parametrize(
+        "text",
+        ["", "{}", '[{"number": 1}]', '[{"number": "1", "merge_commit_sha": null}]'],
+    )
+    def test_commit_pulls_malformed_is_refused(self, text: str) -> None:
+        with pytest.raises(ReleaseError):
+            release.commit_pulls_from_json(text)
 
 
 # ---- Next version from tags -------------------------------------------------
@@ -220,6 +311,8 @@ class TestDocsOnly:
             ["README.md"],
             ["docs/STATUS.md"],
             ["docs/deep/nested/file.png", "AGENTS.md", "CLAUDE.md"],
+            ["nvfanread/README.md"],  # no .md file ships in either .deb
+            ["tools/ec-probe/README.md", "docs/x.txt"],
         ],
     )
     def test_docs_only(self, paths: list[str]) -> None:
@@ -229,13 +322,13 @@ class TestDocsOnly:
         "paths",
         [
             [],  # an empty change set is not "docs only"; it releases
-            ["nvfanread/README.md"],  # a .md below the top level is not docs
             ["README.md", "scripts/build-debs.sh"],
             [".github/workflows/release.yml"],
             ["packaging/nvfanread/DEBIAN/control"],
             ["nvfanread/nvfanread.c"],
             ["docsx/file"],
             ["README.mdx"],
+            ["nvfanread/docs/x.c"],
         ],
     )
     def test_releases(self, paths: list[str]) -> None:
@@ -247,7 +340,9 @@ class TestDocsOnly:
 
 class TestNotes:
     def test_real_pr17_body(self) -> None:
-        body = json.loads((FIXTURES / "pr17.json").read_text())["body"]
+        body = release.pr_from_graphql(
+            (FIXTURES / "pr17_graphql.json").read_text()
+        ).body
         summary = release.quick_summary(body)
         assert summary.startswith("- On kernel 7.0.0-1025, a built-in kernel driver")
         assert summary.endswith("Closes #15")
@@ -257,9 +352,30 @@ class TestNotes:
         body = "## Quick summary\n\nOne.\n\n### Detail\n\nTwo.\n\n## Next\n\nNo."
         assert release.quick_summary(body) == "One.\n\n### Detail\n\nTwo."
 
-    def test_heading_inside_code_fence_does_not_end_it(self) -> None:
-        body = "## Quick summary\n\nRun:\n\n```\n## not a heading\n```\n\n## Next\n"
-        assert release.quick_summary(body) == "Run:\n\n```\n## not a heading\n```"
+    def test_stops_at_next_h1(self) -> None:
+        body = "## Quick summary\n\nOne.\n\n# Big heading\n\nNo."
+        assert release.quick_summary(body) == "One."
+
+    def test_heading_inside_backtick_fence_does_not_end_it(self) -> None:
+        body = (
+            "## Quick summary\n\nRun:\n\n```\n## not a heading\n# nor this\n```\n\n"
+            "## Next\n"
+        )
+        assert release.quick_summary(body) == (
+            "Run:\n\n```\n## not a heading\n# nor this\n```"
+        )
+
+    def test_heading_inside_tilde_fence_does_not_end_it(self) -> None:
+        body = (
+            "## Quick summary\n\nRun:\n\n~~~sh\n# a comment\n~~~\n\nAfter.\n\n## Next\n"
+        )
+        assert (
+            release.quick_summary(body) == "Run:\n\n~~~sh\n# a comment\n~~~\n\nAfter."
+        )
+
+    def test_backticks_do_not_close_a_tilde_fence(self) -> None:
+        body = "## Quick summary\n\n~~~\n```\n## inside\n~~~\n\n## Next\n"
+        assert release.quick_summary(body) == "~~~\n```\n## inside\n~~~"
 
     def test_crlf_body_from_web_editor(self) -> None:
         body = "## Quick summary\r\n\r\nLine one.\r\n\r\n## Next\r\n"
@@ -277,6 +393,7 @@ class TestNotes:
             "No headings at all.",
             "## Summary\n\nWrong heading.",
             "## Quick summary\n\n\n## Next\n\nText.",
+            "## Quick summary\n\n# Next\n\nText.",
             "## Quick summary\n   \n",
             "### Quick summary\n\nWrong level.",
         ],
@@ -293,68 +410,68 @@ class TestNotes:
             "Pull request: https://github.com/evanwtf/dgx-spark-fan-override/pull/17\n"
         )
 
-    def test_body_from_gh_json(self) -> None:
-        text = (FIXTURES / "pr17.json").read_text()
-        assert release.body_from_gh_json(text).startswith("## Quick summary")
 
-    @pytest.mark.parametrize("text", ["", "[]", "{}", '{"body": null}', "x"])
-    def test_body_from_bad_json_is_refused(self, text: str) -> None:
-        with pytest.raises(ReleaseError):
-            release.body_from_gh_json(text)
+class TestNotesCommand:
+    """`notes` against a real git commit (in a temp repo) and a saved answer."""
 
-    def test_notes_command_writes_file_unchanged(self, tmp_path: Path) -> None:
-        tricky = "Uses `$(echo pwned)` and `` ` `` verbatim."
-        pr_json = tmp_path / "pr.json"
-        pr_json.write_text(json.dumps({"body": f"## Quick summary\n\n{tricky}\n"}))
-        out = tmp_path / "notes.md"
-        rc = release.main(
-            [
-                "notes",
-                "--pr",
-                "5",
-                "--repo",
-                REPO,
-                "--pr-json",
-                str(pr_json),
-                "--out",
-                str(out),
-            ]
+    @pytest.fixture
+    def sha(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        env = {
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "PATH": "/usr/bin:/bin",
+        }
+        for args in (
+            ["init", "-q"],
+            ["commit", "-q", "--allow-empty", "-m", "x (#17)"],
+        ):
+            subprocess.run(["git", "-C", str(repo), *args], check=True, env=env)
+        monkeypatch.chdir(repo)
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
         )
+        return out.stdout.strip()
+
+    def run(self, tmp_path: Path, sha: str, answer: str) -> tuple[int, Path]:
+        pr_json = tmp_path / "pr.json"
+        pr_json.write_text(answer)
+        out = tmp_path / "notes.md"
+        args = ["notes", "--pr", "17", "--rev", sha, "--repo", REPO]
+        args += ["--pr-json", str(pr_json), "--out", str(out)]
+        rc = release.main(args)
+        return rc, out
+
+    def test_writes_file_unchanged(self, tmp_path: Path, sha: str) -> None:
+        tricky = "Uses `$(echo pwned)` and `` ` `` verbatim."
+        answer = graphql(merge_oid=sha, body=f"## Quick summary\n\n{tricky}\n")
+        rc, out = self.run(tmp_path, sha, answer)
         assert rc == 0
         assert (
             out.read_bytes()
             == (
-                f"{tricky}\n\nPull request: https://github.com/{REPO}/pull/5\n"
+                f"{tricky}\n\nPull request: https://github.com/{REPO}/pull/17\n"
             ).encode()
         )
 
-    def test_notes_command_refuses_missing_summary(self, tmp_path: Path) -> None:
-        pr_json = tmp_path / "pr.json"
-        pr_json.write_text(json.dumps({"body": "nothing here"}))
-        out = tmp_path / "notes.md"
-        rc = release.main(
-            [
-                "notes",
-                "--pr",
-                "5",
-                "--repo",
-                REPO,
-                "--pr-json",
-                str(pr_json),
-                "--out",
-                str(out),
-            ]
-        )
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"body": "nothing here"},
+            {"last_edited_at": "2026-11-27T00:00:00Z"},
+            {"merge_oid": "b" * 40},
+            {"state": "CLOSED", "merge_oid": None, "merged_at": None},
+        ],
+    )
+    def test_refusals_write_nothing(
+        self, tmp_path: Path, sha: str, change: dict[str, str | None]
+    ) -> None:
+        fields: dict[str, str | None] = {"merge_oid": sha, **change}
+        rc, out = self.run(tmp_path, sha, graphql(**fields))  # type: ignore[arg-type]
         assert rc != 0
         assert not out.exists()
-
-    def test_direct_push_notes_from_commit_message(self) -> None:
-        notes = release.commit_notes("Fix the thing\n\nLonger text.\n", "abc123", REPO)
-        assert notes == (
-            "Fix the thing\n\nLonger text.\n\n"
-            "Commit: https://github.com/evanwtf/dgx-spark-fan-override/commit/abc123\n"
-        )
-
-    def test_direct_push_with_empty_message_is_refused(self) -> None:
-        with pytest.raises(ReleaseError):
-            release.commit_notes("  \n", "abc123", REPO)
