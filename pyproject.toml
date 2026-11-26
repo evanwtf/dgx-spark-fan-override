@@ -1,0 +1,37 @@
+# Tooling only: the release CLI in scripts/ and its tests. This repo ships
+# .deb packages, not a Python wheel, so uv does not build or install a package.
+[project]
+name = "dgx-spark-fan-override-tools"
+# Not the repo version. uv requires this field; the released version lives only
+# in the git tag that the release workflow creates (see README "Releases").
+version = "0.0.0"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = ["ruff", "mypy", "pytest"]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+src = ["scripts", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["scripts", "tests"]
+mypy_path = "scripts"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["scripts"]
+markers = [
+    "slow: large-fixture runs; not part of the default suite",
+]
+addopts = "-m 'not slow'"
