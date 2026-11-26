@@ -11,6 +11,7 @@
  * No external test framework: a couple of CHECK macros and a summary. Exit
  * status is 0 only if every check passed.
  */
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -190,6 +191,75 @@ static void test_layout_constants(void)
 	CHECK(NVFR_TELEMETRY_DATA_OFFSET + NVFR_TELEMETRY_LEN <= NVFR_SNAP_LEN);
 }
 
+/*
+ * The module finds the eSPI service by UUID on the FF-A bus instead of binding
+ * it (the built-in nvidia-ffa-ec driver binds it on 7.0+ kernels).
+ */
+static void test_uuid_match(void)
+{
+	/* 884a63a0-3285-4120-83aa-eec008a0a546 in uuid_t (big-endian) order. */
+	const nvfr_u8 espi[16] = {
+		0x88, 0x4a, 0x63, 0xa0, 0x32, 0x85, 0x41, 0x20,
+		0x83, 0xaa, 0xee, 0xc0, 0x08, 0xa0, 0xa5, 0x46,
+	};
+	/* The same UUID in ACPI ToUUID() mixed-endian order must NOT match. */
+	const nvfr_u8 mixed[16] = {
+		0xa0, 0x63, 0x4a, 0x88, 0x85, 0x32, 0x20, 0x41,
+		0x83, 0xaa, 0xee, 0xc0, 0x08, 0xa0, 0xa5, 0x46,
+	};
+	/* Fan service 7697530c-d079-4ec1-a4c4-cf0d2bdc93fa: another EC service. */
+	const nvfr_u8 fan_svc[16] = {
+		0x76, 0x97, 0x53, 0x0c, 0xd0, 0x79, 0x4e, 0xc1,
+		0xa4, 0xc4, 0xcf, 0x0d, 0x2b, 0xdc, 0x93, 0xfa,
+	};
+	const nvfr_u8 null_uuid[16] = { 0 };
+	nvfr_u8 last_byte_off[16];
+
+	CHECK(nvfr_uuid_is_espi(espi));
+	CHECK(!nvfr_uuid_is_espi(mixed));
+	CHECK(!nvfr_uuid_is_espi(fan_svc));
+	CHECK(!nvfr_uuid_is_espi(null_uuid));
+
+	memcpy(last_byte_off, espi, sizeof(last_byte_off));
+	last_byte_off[15] ^= 0x01;
+	CHECK(!nvfr_uuid_is_espi(last_byte_off));
+}
+
+/*
+ * Retry policy for the FF-A send. The EC secure partition is shared by many
+ * services and answers FFA_RET_BUSY (-EBUSY) while another request is in
+ * flight. Only -EBUSY retries, and only inside both bounds.
+ */
+static void test_send_retry_policy(void)
+{
+	/* Success and non-busy errors never retry. */
+	CHECK(!nvfr_send_should_retry(0, 1, 0));
+	CHECK(!nvfr_send_should_retry(-EIO, 1, 0));
+	CHECK(!nvfr_send_should_retry(-EAGAIN, 1, 0));
+	CHECK(!nvfr_send_should_retry(-EINVAL, 1, 0));
+	CHECK(!nvfr_send_should_retry(-EOPNOTSUPP, 1, 0));
+	CHECK(!nvfr_send_should_retry(-ETIMEDOUT, 1, 0));
+	CHECK(!nvfr_send_should_retry(EBUSY, 1, 0));    /* wrong sign */
+
+	/* -EBUSY retries while both bounds hold. */
+	CHECK(nvfr_send_should_retry(-EBUSY, 1, 0));
+	CHECK(nvfr_send_should_retry(-EBUSY, NVFR_SEND_MAX_ATTEMPTS - 1,
+				     NVFR_SEND_RETRY_BUDGET_US - 1));
+
+	/* The attempt bound stops it. */
+	CHECK(!nvfr_send_should_retry(-EBUSY, NVFR_SEND_MAX_ATTEMPTS, 0));
+	CHECK(!nvfr_send_should_retry(-EBUSY, NVFR_SEND_MAX_ATTEMPTS + 1, 0));
+
+	/* The time bound stops it. */
+	CHECK(!nvfr_send_should_retry(-EBUSY, 1, NVFR_SEND_RETRY_BUDGET_US));
+	CHECK(!nvfr_send_should_retry(-EBUSY, 1, NVFR_SEND_RETRY_BUDGET_US + 1));
+
+	/* Bounds match nvidia-ffa-ec's 10 ms FFH retry, and stay small. */
+	CHECK_EQ(NVFR_SEND_RETRY_BUDGET_US, 10000);
+	CHECK(NVFR_SEND_MAX_ATTEMPTS >= 2);
+	CHECK(NVFR_SEND_MAX_ATTEMPTS <= 50);
+}
+
 int main(void)
 {
 	test_le16();
@@ -200,6 +270,8 @@ int main(void)
 	test_rpm_classification();
 	test_fan_rpm_decode();
 	test_layout_constants();
+	test_uuid_match();
+	test_send_retry_policy();
 
 	if (g_failures == 0) {
 		printf("ok - %d checks passed\n", g_checks);
