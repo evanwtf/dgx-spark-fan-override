@@ -9,10 +9,16 @@ provides two independent kernel modules:
 | [`nvfancontrol`](nvfancontrol/) | **write** | Override the fans: force 100% or restore the EC's automatic thermal policy. |
 | [`nvfanread`](nvfanread/) | **read-only** | Read fan telemetry from the EC without changing anything; intended to surface fan RPM through hwmon / `sensors` / node_exporter. |
 
-Both bind the same verified FF-A partition (`arm-ffa-17`) but only one can be
-bound at a time. `nvfanread` is the read-only tool — see
-[`nvfanread/README.md`](nvfanread/README.md). Everything below documents the
-shared EC/FF-A protocol.
+Both talk to the same verified FF-A eSPI service (`arm-ffa-17`). `nvfanread` is
+the read-only tool — see [`nvfanread/README.md`](nvfanread/README.md).
+Everything below documents the shared EC/FF-A protocol.
+
+> **Kernel 7.0 and later.** The built-in `nvidia-ffa-ec` driver now binds
+> `arm-ffa-17` itself, and no other driver can take it over (see
+> [#15](https://github.com/evanwtf/dgx-spark-fan-override/issues/15)).
+> `nvfanread` 1.1.0 works with this: it uses the device without binding it.
+> `nvfancontrol` still binds as a driver, so on these kernels it loads but does
+> not attach.
 
 ### Motivation: fan RPM in Prometheus
 
@@ -81,15 +87,21 @@ Linux kernel module
   -> PWM0/TACH0 and PWM1/TACH1
 ```
 
-FF-A raw-eSPI partition:
+FF-A raw-eSPI service:
 
 ```text
 device:       /sys/bus/arm_ffa/devices/arm-ffa-17
 UUID:         884a63a0-3285-4120-83aa-eec008a0a546
-partition ID: 0x11
+partition ID: 0x8003
 properties:   0x109
 shared page:  0x933DD000, size 0x1000
 ```
+
+The partition ID is the FF-A endpoint ID (`partition_id` in sysfs). On kernel
+7.0.0-1025 it reads `0x8003`, and the other EC services (thermal, fan, power and
+more) share it: one secure partition serves many UUIDs. The `17` in `arm-ffa-17`
+(`0x11`) is only the bus device index. Earlier versions of this README gave
+`0x11` as the partition ID, which mixed up the two.
 
 ## EC fan-control firmware reference
 
