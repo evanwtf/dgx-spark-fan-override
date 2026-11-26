@@ -113,7 +113,7 @@ sweep EC command / lengths / cache mode; build+sign+load via `run.sh`).
 
 ## What's done
 - **Read-only `nvfanread` module** (the *decoder*): uses `arm-ffa-17` (bound it
-  before 1.1.0), issues only
+  before the #17 build), issues only
   EC **command 7** (telemetry, read-only — never an override write), exposes a
   `telemetry` sysfs attr that dumps the 64-byte snapshot + flags u16s in the fan
   RPM ranges. Built, CI-green. Pure protocol logic in `nvfanread_proto.h`.

@@ -10,7 +10,7 @@ and the shared-page bytes — whether the request succeeds or fails.
 
 On kernel 7.0.0-1025 and later it does not bind: the built-in `nvidia-ffa-ec` driver
 owns `arm-ffa-17` (see #15), so `probe` does not appear. On older kernels it
-cannot bind while `nvfanread` 1.1.0 is loaded, because `nvfanread` claims the
+cannot bind while `nvfanread` (the #17 build or later) is loaded, because `nvfanread` claims the
 device.
 
 ## Parameters

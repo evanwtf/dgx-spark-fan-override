@@ -22,7 +22,9 @@ this works on each kernel.
 > [#17](https://github.com/evanwtf/dgx-spark-fan-override/pull/17). A build
 > without the lock can write the shared page at the same time as the other
 > module. `nvfancontrol` refuses to send (`error -11`) while it sees an
-> `nvfanread` without the lock.
+> `nvfanread` without the lock. The #17 build also reports version 1.1.0, the
+> same as the first release (v1.1.0, which has the lock). To tell them apart,
+> check for the lock's symbol: `grep -w nvfanread_mailbox_lock_v1 /proc/kallsyms`.
 
 `nvfanread` is the read-only tool — see
 [`nvfanread/README.md`](nvfanread/README.md). Everything below documents the

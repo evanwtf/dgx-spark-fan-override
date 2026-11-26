@@ -82,15 +82,18 @@ device is unbound, or bound to `nvidia-ffa-ec` or to `nvfanread`.
 
 Install `nvfanread` and `nvfancontrol` from the same release. Builds without the
 lock (`nvfanread` 1.0.0 and the build from #17) do not export the marker
-symbol, so `nvfancontrol` refuses to send while one is loaded.
+symbol, so `nvfancontrol` refuses to send while one is loaded. The hand-made
+build from #17 also reports version 1.1.0, the same as the first release, so
+check for the symbol, not the version:
+`grep -w nvfanread_mailbox_lock_v1 /proc/kallsyms`.
 
 The secure partition also serves other EC services. It answers "busy" when
 another request is in flight, so `nvfanread` retries a busy send for up to
 10 ms (20 tries), as `nvidia-ffa-ec` does. Each result, good or bad, is cached
 for 200 ms, so a tight reader loop cannot flood the partition.
 
-If the FF-A device is missing, 1.1.0 fails to load with `-ENODEV` (1.0.0 loaded
-and stayed unbound), so `systemd-modules-load` reports a failure on such a
+If the FF-A device is missing, `nvfanread` (the #17 build and later) fails to
+load with `-ENODEV` (1.0.0 loaded and stayed unbound), so `systemd-modules-load` reports a failure on such a
 system.
 
 ## Safety
