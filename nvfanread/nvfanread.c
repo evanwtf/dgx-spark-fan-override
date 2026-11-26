@@ -2,19 +2,24 @@
 /*
  * DGX Spark read-only EC fan telemetry probe.
  *
- * This module is deliberately READ-ONLY. It binds the verified FF-A partition
- * and creates:
+ * This module is deliberately READ-ONLY. It finds the EC eSPI FF-A service
+ * (UUID 884a63a0-3285-4120-83aa-eec008a0a546, bus device arm-ffa-17) and
+ * registers a hwmon device "nvfanread" under it, with fan1_input/fan2_input
+ * and a raw "telemetry" debug attribute.
  *
- *   /sys/bus/arm_ffa/devices/arm-ffa-17/telemetry
+ * The module does NOT bind the FF-A device. On 7.0+ nvidia kernels the
+ * built-in nvidia-ffa-ec driver binds that UUID (Ubuntu commit 9c0c984e122c),
+ * sets suppress_bind_attrs, and the FF-A bus has no driver_override, so no
+ * other driver can bind it. nvidia-ffa-ec only routes ACPI FFH requests to the
+ * service and never touches the shared page this module uses. So the module
+ * looks the device up on the bus and sends through its ops without owning it.
+ * See issue #15.
  *
- * Reading that attribute issues a single OEM1 command 17 carrying EC inner
- * command 7 ("thermal control / fan operation telemetry snapshot"), which the
- * EC firmware documents as a pure read: it copies 64 bytes from EC SRAM
- * 0x1188E2 into the reply and touches NEITHER fan-override slot (0x119190 /
- * 0x119192 are written only by EC commands 3 and 5, which this module never
- * issues). The attribute returns the raw 64 bytes as hex, plus a list of
- * little-endian u16 values that fall inside the known fan RPM ranges, so the
- * current-RPM offsets can be decoded and later surfaced through hwmon.
+ * Reading fan RPM issues a single OEM1 command 17 carrying EC inner command 7
+ * ("thermal control / fan operation telemetry snapshot"), which the EC
+ * firmware documents as a pure read: it copies 64 bytes from EC SRAM 0x1188E2
+ * into the reply and touches NEITHER fan-override slot (0x119190 / 0x119192
+ * are written only by EC commands 3 and 5, which this module never issues).
  *
  * The pure protocol logic lives in nvfanread_proto.h and is unit-tested in
  * userspace; this file adds the FF-A / shared-page I/O around it. The mailbox
@@ -23,8 +28,11 @@
  * serialized under a mutex.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/arm_ffa.h>
 #include <linux/delay.h>
+#include <linux/device/bus.h>
 #include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/hwmon.h>
@@ -60,25 +68,57 @@
  */
 #define NVFANREAD_CACHE_MS         200U
 
+/*
+ * Module-global state. The FF-A device belongs to another driver, so nothing
+ * is stored in its drvdata; the hwmon device's drvdata points here.
+ */
 struct nvfanread_state {
-	struct ffa_device *fdev;
+	struct ffa_device *fdev;	/* reference held from bus_find_device() */
+	struct device *hwmon;
 	struct mutex request_lock;
 	u8 cache[NVFR_TELEMETRY_LEN];
 	ktime_t cache_time;
 	bool cache_valid;
 };
 
-static void restore_shared_page(struct device *dev, u8 *shm,
-				const u8 snapshot[NVFR_SNAP_LEN])
+static struct nvfanread_state nvfanread_state = {
+	.request_lock = __MUTEX_INITIALIZER(nvfanread_state.request_lock),
+};
+
+static void restore_shared_page(u8 *shm, const u8 snapshot[NVFR_SNAP_LEN])
 {
 	memcpy(shm, snapshot, NVFR_SNAP_LEN);
 	/* Ensure the restore write lands in the shared page before we verify it. */
 	mb();
 
 	if (memcmp(shm, snapshot, NVFR_SNAP_LEN))
-		dev_crit(dev,
-			 "SHARED-BUFFER RESTORE VERIFY FAILED at physical address %#llx\n",
-			 ESPI_NS_SHM_PA);
+		pr_crit("SHARED-BUFFER RESTORE VERIFY FAILED at physical address %#llx\n",
+			ESPI_NS_SHM_PA);
+}
+
+/*
+ * Ring the doorbell (FF-A direct request 2, OEM1 command 17). The EC secure
+ * partition is shared by many services and answers -EBUSY while another
+ * request is in flight, so retry inside the bounds in nvfanread_proto.h.
+ * Any other result returns at once.
+ */
+static int send_doorbell(struct ffa_device *fdev, struct ffa_send_direct_data2 *msg,
+			 s64 *elapsed_us, unsigned int *attempts)
+{
+	ktime_t start = ktime_get();
+	int ret;
+
+	*attempts = 0;
+	for (;;) {
+		memset(msg, 0, sizeof(*msg));
+		((u8 *)msg->data)[0] = ESPI_OEM_GENERIC_EMI;
+		ret = fdev->ops->msg_ops->sync_send_receive2(fdev, msg);
+		(*attempts)++;
+		*elapsed_us = ktime_us_delta(ktime_get(), start);
+		if (!nvfr_send_should_retry(ret, *attempts, *elapsed_us))
+			return ret;
+		usleep_range(500, 1000);
+	}
 }
 
 /*
@@ -92,19 +132,18 @@ static int read_telemetry(struct nvfanread_state *state,
 	struct ffa_send_direct_data2 msg = {};
 	u8 snapshot[NVFR_SNAP_LEN];
 	u8 frame[NVFR_SNAP_LEN];
-	u8 *payload = (u8 *)msg.data;
 	u8 *shm;
 	unsigned long pfn = PHYS_PFN(ESPI_NS_SHM_PA);
 	u32 service_status;
 	bool map_memory;
 	bool reserved_page = false;
+	unsigned int attempts;
 	unsigned int elapsed;
-	ktime_t start;
 	s64 elapsed_us;
 	int ret;
 
 	if (nvfr_build_request_frame(frame, sizeof(frame))) {
-		dev_err(&fdev->dev, "internal error: request frame too small\n");
+		pr_err("internal error: request frame too small\n");
 		return -EINVAL;
 	}
 
@@ -113,14 +152,13 @@ static int read_telemetry(struct nvfanread_state *state,
 		reserved_page = PageReserved(pfn_to_page(pfn));
 
 	if (map_memory && !reserved_page) {
-		dev_err(&fdev->dev,
-			"refusing ns_shm0: PFN is Linux map memory but is not marked reserved\n");
+		pr_err("refusing ns_shm0: PFN is Linux map memory but is not marked reserved\n");
 		return -EPERM;
 	}
 
 	shm = memremap(ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE, MEMREMAP_WB);
 	if (!shm) {
-		dev_err(&fdev->dev, "memremap of manifest ns_shm0 failed\n");
+		pr_err("memremap of manifest ns_shm0 failed\n");
 		return -ENOMEM;
 	}
 
@@ -128,8 +166,7 @@ static int read_telemetry(struct nvfanread_state *state,
 
 	if (!nvfr_mailbox_idle(snapshot[NVFR_FRAME_INPUT_ACCEPTED],
 			       snapshot[NVFR_FRAME_OUTPUT_READY])) {
-		dev_err(&fdev->dev,
-			"refusing request: shared mailbox is not idle (accepted=%#04x ready=%#04x)\n",
+		pr_err("refusing request: shared mailbox is not idle (accepted=%#04x ready=%#04x)\n",
 			snapshot[NVFR_FRAME_INPUT_ACCEPTED],
 			snapshot[NVFR_FRAME_OUTPUT_READY]);
 		ret = -EBUSY;
@@ -140,29 +177,23 @@ static int read_telemetry(struct nvfanread_state *state,
 	/* Publish the request frame to the shared page before the doorbell send. */
 	mb();
 
-	payload[0] = ESPI_OEM_GENERIC_EMI;
-	start = ktime_get();
-	ret = fdev->ops->msg_ops->sync_send_receive2(fdev, &msg);
-	elapsed_us = ktime_us_delta(ktime_get(), start);
+	ret = send_doorbell(fdev, &msg, &elapsed_us, &attempts);
 	if (ret) {
-		dev_crit(&fdev->dev,
-			 "FF-A TRANSPORT FAILURE: ret=%d elapsed=%lld us\n",
-			 ret, elapsed_us);
-		restore_shared_page(&fdev->dev, shm, snapshot);
+		pr_crit("FF-A TRANSPORT FAILURE: ret=%d attempts=%u elapsed=%lld us\n",
+			ret, attempts, elapsed_us);
+		restore_shared_page(shm, snapshot);
 		goto out_unmap;
 	}
 
 	service_status = get_unaligned_le32((u8 *)msg.data);
 	if (service_status != 0) {
 		if (service_status == 5 && elapsed_us >= ESPI_TIMEOUT_FLOOR_US)
-			dev_crit(&fdev->dev,
-				 "eSPI TIMEOUT: internal mailbox operation timed out (status=5)\n");
+			pr_crit("eSPI TIMEOUT: internal mailbox operation timed out (status=5)\n");
 		else
-			dev_crit(&fdev->dev,
-				 "SERVICE REJECTED: status=%u\n", service_status);
+			pr_crit("SERVICE REJECTED: status=%u\n", service_status);
 
 		ret = service_status == 10 ? -EBUSY : -EIO;
-		restore_shared_page(&fdev->dev, shm, snapshot);
+		restore_shared_page(shm, snapshot);
 		goto out_unmap;
 	}
 
@@ -173,13 +204,12 @@ static int read_telemetry(struct nvfanread_state *state,
 	}
 
 	if (READ_ONCE(shm[NVFR_FRAME_OUTPUT_READY]) != 1) {
-		dev_crit(&fdev->dev,
-			 "OUTPUT TIMEOUT after %u ms: accepted=%#04x ready=%#04x\n",
+		pr_crit("OUTPUT TIMEOUT after %u ms: accepted=%#04x ready=%#04x\n",
 			 REPLY_TIMEOUT_MS,
 			 READ_ONCE(shm[NVFR_FRAME_INPUT_ACCEPTED]),
 			 READ_ONCE(shm[NVFR_FRAME_OUTPUT_READY]));
 		ret = -ETIMEDOUT;
-		restore_shared_page(&fdev->dev, shm, snapshot);
+		restore_shared_page(shm, snapshot);
 		goto out_unmap;
 	}
 
@@ -187,22 +217,20 @@ static int read_telemetry(struct nvfanread_state *state,
 	mb();
 
 	if (!nvfr_reply_header_ok(&shm[NVFR_FRAME_DATA_OFFSET])) {
-		dev_crit(&fdev->dev,
-			 "UNEXPECTED REPLY HEADER: %#04x %#04x %#04x\n",
+		pr_crit("UNEXPECTED REPLY HEADER: %#04x %#04x %#04x\n",
 			 shm[NVFR_FRAME_DATA_OFFSET],
 			 shm[NVFR_FRAME_DATA_OFFSET + 1],
 			 shm[NVFR_FRAME_DATA_OFFSET + 2]);
 		ret = -EPROTO;
-		restore_shared_page(&fdev->dev, shm, snapshot);
+		restore_shared_page(shm, snapshot);
 		goto out_unmap;
 	}
 
 	memcpy(out, &shm[NVFR_TELEMETRY_DATA_OFFSET], NVFR_TELEMETRY_LEN);
-	dev_info(&fdev->dev,
-		 "telemetry read OK in <=%u ms (decode via sysfs)\n", elapsed);
+	pr_info("telemetry read OK in <=%u ms (decode via sysfs)\n", elapsed);
 
 	ret = 0;
-	restore_shared_page(&fdev->dev, shm, snapshot);
+	restore_shared_page(shm, snapshot);
 
 out_unmap:
 	memunmap(shm);
@@ -291,6 +319,13 @@ static ssize_t telemetry_show(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_RO(telemetry);
 
+/* Lives on the hwmon device (extra_groups), never on the FF-A device. */
+static struct attribute *nvfanread_extra_attrs[] = {
+	&dev_attr_telemetry.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(nvfanread_extra);
+
 /* ---- hwmon: fan1_input / fan2_input in RPM (channels 0 and 1) ---- */
 
 static const char * const nvfanread_fan_labels[] = { "fan0", "fan1" };
@@ -356,76 +391,78 @@ static const struct hwmon_chip_info nvfanread_hwmon_chip = {
 	.info = nvfanread_hwmon_info,
 };
 
-static int fan_read_probe(struct ffa_device *fdev)
+static int nvfanread_match_espi(struct device *dev, const void *data)
 {
-	struct nvfanread_state *state;
+	return nvfr_uuid_is_espi(to_ffa_dev(dev)->uuid.b);
+}
+
+static int __init nvfanread_init(void)
+{
+	struct nvfanread_state *state = &nvfanread_state;
+	const struct device_driver *owner;
+	struct ffa_device *fdev;
+	struct device *dev;
 	struct device *hwmon;
-	int ret;
+
+	dev = bus_find_device(&ffa_bus_type, NULL, NULL, nvfanread_match_espi);
+	if (!dev) {
+		pr_err("FF-A eSPI service 884a63a0-3285-4120-83aa-eec008a0a546 not found on the arm_ffa bus\n");
+		return -ENODEV;
+	}
+	fdev = to_ffa_dev(dev);
 
 	if (!fdev->ops || !fdev->ops->msg_ops ||
 	    !fdev->ops->msg_ops->sync_send_receive2) {
-		dev_err(&fdev->dev, "FF-A Direct Request 2 is unavailable\n");
+		pr_err("%s: FF-A Direct Request 2 is unavailable\n", dev_name(dev));
+		put_device(dev);
 		return -EOPNOTSUPP;
 	}
 
 	if (fdev->mode_32bit) {
-		dev_err(&fdev->dev,
-			"refusing Direct Request 2 for a 32-bit-mode device\n");
+		pr_err("%s: refusing Direct Request 2 for a 32-bit-mode device\n",
+		       dev_name(dev));
+		put_device(dev);
 		return -EOPNOTSUPP;
 	}
 
-	state = devm_kzalloc(&fdev->dev, sizeof(*state), GFP_KERNEL);
-	if (!state)
-		return -ENOMEM;
-
 	state->fdev = fdev;
-	mutex_init(&state->request_lock);
-	dev_set_drvdata(&fdev->dev, state);
 
-	ret = device_create_file(&fdev->dev, &dev_attr_telemetry);
-	if (ret) {
-		dev_err(&fdev->dev, "failed to create sysfs telemetry attribute: %d\n",
-			ret);
-		return ret;
-	}
-
-	hwmon = devm_hwmon_device_register_with_info(&fdev->dev, "nvfanread",
-						     state, &nvfanread_hwmon_chip,
-						     NULL);
+	hwmon = hwmon_device_register_with_info(dev, "nvfanread", state,
+						&nvfanread_hwmon_chip,
+						nvfanread_extra_groups);
 	if (IS_ERR(hwmon)) {
-		device_remove_file(&fdev->dev, &dev_attr_telemetry);
+		pr_err("%s: hwmon registration failed: %ld\n", dev_name(dev),
+		       PTR_ERR(hwmon));
+		state->fdev = NULL;
+		put_device(dev);
 		return PTR_ERR(hwmon);
 	}
+	state->hwmon = hwmon;
 
-	dev_info(&fdev->dev,
-		 "read-only fan telemetry ready: hwmon '%s' (fan1_input/fan2_input) + %s/telemetry; module load issued no EC request\n",
-		 dev_name(hwmon), dev_name(&fdev->dev));
+	/* Racy read, for the log only: show who owns the device we share. */
+	owner = READ_ONCE(dev->driver);
+	pr_info("%s (partition %#x) is bound to driver '%s'; nvfanread uses it without binding\n",
+		dev_name(dev), fdev->vm_id, owner ? owner->name : "(none)");
+	pr_info("read-only fan telemetry ready: hwmon '%s' (fan1_input/fan2_input/telemetry) under %s; module load issued no EC request\n",
+		dev_name(hwmon), dev_name(dev));
 	return 0;
 }
 
-static void fan_read_remove(struct ffa_device *fdev)
+static void __exit nvfanread_exit(void)
 {
-	device_remove_file(&fdev->dev, &dev_attr_telemetry);
+	struct nvfanread_state *state = &nvfanread_state;
+
+	/* Unregister first: after this no reader can reach state->fdev. */
+	hwmon_device_unregister(state->hwmon);
+	state->hwmon = NULL;
+	put_device(&state->fdev->dev);
+	state->fdev = NULL;
 }
 
-static const struct ffa_device_id fan_read_ids[] = {
-	{
-		.uuid = UUID_INIT(0x884a63a0, 0x3285, 0x4120,
-				  0x83, 0xaa, 0xee, 0xc0,
-				  0x08, 0xa0, 0xa5, 0x46),
-	},
-	{},
-};
-
-static struct ffa_driver fan_read_driver = {
-	.name = "nvfanread",
-	.probe = fan_read_probe,
-	.remove = fan_read_remove,
-	.id_table = fan_read_ids,
-};
-
-module_ffa_driver(fan_read_driver);
+module_init(nvfanread_init);
+module_exit(nvfanread_exit);
 
 MODULE_DESCRIPTION("DGX Spark read-only EC fan telemetry probe");
 MODULE_AUTHOR("Evan Hoffman");
 MODULE_LICENSE("GPL");
+MODULE_VERSION("1.1.0");
