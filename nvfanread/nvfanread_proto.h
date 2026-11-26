@@ -207,4 +207,46 @@ static inline int nvfr_send_should_retry(int ret, unsigned int attempts,
 	       elapsed_us < NVFR_SEND_RETRY_BUDGET_US;
 }
 
+/*
+ * Driver names allowed to own the FF-A device while nvfanread uses the shared
+ * page. The page has no lock; binding the device is the only exclusion.
+ *   NULL           - unbound (nvfanread's own driver lost the race or was
+ *                    unbound; nothing else is writing the page)
+ *   nvidia-ffa-ec  - the built-in driver on 7.0.0-1025+; it forwards ACPI FFH
+ *                    requests in registers and never uses the page
+ *   nvfanread      - our own claim driver (6.17 / 7.0.0-1019)
+ * Anything else (nvfancontrol, ec-probe's nvfanprobe) writes the page itself.
+ */
+#define NVFR_DRIVER_NAME            "nvfanread"
+#define NVFR_NVIDIA_EC_DRIVER_NAME  "nvidia-ffa-ec"
+
+static inline int nvfr_streq(const char *a, const char *b)
+{
+	while (*a && *a == *b) {
+		a++;
+		b++;
+	}
+	return *a == *b;
+}
+
+static inline int nvfr_owner_allowed(const char *driver_name)
+{
+	if (!driver_name)
+		return 1;
+	return nvfr_streq(driver_name, NVFR_NVIDIA_EC_DRIVER_NAME) ||
+	       nvfr_streq(driver_name, NVFR_DRIVER_NAME);
+}
+
+/*
+ * Reuse a result (success or failure) this young. Reading fan1 then fan2 then
+ * costs one EC transaction, and a reader loop on a failing EC cannot send more
+ * than one doorbell burst per period.
+ */
+#define NVFR_CACHE_US               200000LL
+
+static inline int nvfr_cache_fresh(int valid, long long age_us)
+{
+	return valid && age_us >= 0 && age_us < NVFR_CACHE_US;
+}
+
 #endif /* NVFANREAD_PROTO_H */

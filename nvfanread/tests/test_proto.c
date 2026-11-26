@@ -260,6 +260,48 @@ static void test_send_retry_policy(void)
 	CHECK(NVFR_SEND_MAX_ATTEMPTS <= 50);
 }
 
+/*
+ * Mailbox owner check: the shared page has no lock, so nvfanread only uses it
+ * while the FF-A device is unbound, bound to nvidia-ffa-ec (which never uses
+ * the page), or bound to nvfanread itself.
+ */
+static void test_owner_allowed(void)
+{
+	CHECK(nvfr_owner_allowed(NULL));
+	CHECK(nvfr_owner_allowed("nvidia-ffa-ec"));
+	CHECK(nvfr_owner_allowed("nvfanread"));
+	CHECK_EQ(NVFR_DRIVER_NAME[0], 'n');
+
+	/* Drivers that write the shared page themselves. */
+	CHECK(!nvfr_owner_allowed("nvfancontrol"));
+	CHECK(!nvfr_owner_allowed("nvfanprobe"));       /* tools/ec-probe */
+
+	/* Near misses and junk must not pass. */
+	CHECK(!nvfr_owner_allowed(""));
+	CHECK(!nvfr_owner_allowed("nvidia-ffa-e"));
+	CHECK(!nvfr_owner_allowed("nvidia-ffa-ec2"));
+	CHECK(!nvfr_owner_allowed("nvidia-ffa-control"));
+	CHECK(!nvfr_owner_allowed("nvfanread "));
+	CHECK(!nvfr_owner_allowed("NVFANREAD"));
+}
+
+/*
+ * Cache decision. Results (success or failure) are reused while younger than
+ * NVFR_CACHE_US, so a reader loop cannot hammer the shared SP.
+ */
+static void test_cache_fresh(void)
+{
+	CHECK(nvfr_cache_fresh(1, 0));
+	CHECK(nvfr_cache_fresh(1, NVFR_CACHE_US - 1));
+
+	CHECK(!nvfr_cache_fresh(0, 0));                 /* nothing cached */
+	CHECK(!nvfr_cache_fresh(1, NVFR_CACHE_US));     /* at the bound */
+	CHECK(!nvfr_cache_fresh(1, NVFR_CACHE_US + 1));
+	CHECK(!nvfr_cache_fresh(1, -1));                /* clock went back */
+
+	CHECK_EQ(NVFR_CACHE_US, 200000);
+}
+
 int main(void)
 {
 	test_le16();
@@ -272,6 +314,8 @@ int main(void)
 	test_layout_constants();
 	test_uuid_match();
 	test_send_retry_policy();
+	test_owner_allowed();
+	test_cache_fresh();
 
 	if (g_failures == 0) {
 		printf("ok - %d checks passed\n", g_checks);

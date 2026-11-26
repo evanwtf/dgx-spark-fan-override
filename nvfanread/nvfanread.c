@@ -7,13 +7,19 @@
  * registers a hwmon device "nvfanread" under it, with fan1_input/fan2_input
  * and a raw "telemetry" debug attribute.
  *
- * The module does NOT bind the FF-A device. On 7.0+ nvidia kernels the
+ * The module does not need to bind the FF-A device. On 7.0.0-1025+ the
  * built-in nvidia-ffa-ec driver binds that UUID (Ubuntu commit 9c0c984e122c),
  * sets suppress_bind_attrs, and the FF-A bus has no driver_override, so no
  * other driver can bind it. nvidia-ffa-ec only routes ACPI FFH requests to the
  * service and never touches the shared page this module uses. So the module
  * looks the device up on the bus and sends through its ops without owning it.
  * See issue #15.
+ *
+ * The shared page has no lock; binding the device is the only exclusion
+ * between nvfanread, nvfancontrol and ec-probe. So nvfanread also registers a
+ * small claim driver: where the device is free (6.17, 7.0.0-1019) it binds,
+ * as 1.0.0 did. Each read also checks the current owner and refuses with
+ * -EBUSY if a driver that writes the page holds the device.
  *
  * Reading fan RPM issues a single OEM1 command 17 carrying EC inner command 7
  * ("thermal control / fan operation telemetry snapshot"), which the EC
@@ -63,12 +69,6 @@
 #define ESPI_TIMEOUT_FLOOR_US      40000LL
 
 /*
- * Reuse a telemetry snapshot this fresh so reading fan1 then fan2 (as sensors
- * and node_exporter do) costs one EC transaction, not two.
- */
-#define NVFANREAD_CACHE_MS         200U
-
-/*
  * Module-global state. The FF-A device belongs to another driver, so nothing
  * is stored in its drvdata; the hwmon device's drvdata points here.
  */
@@ -77,6 +77,7 @@ struct nvfanread_state {
 	struct device *hwmon;
 	struct mutex request_lock;
 	u8 cache[NVFR_TELEMETRY_LEN];
+	int cache_ret;		/* result of the cached read; failures cache too */
 	ktime_t cache_time;
 	bool cache_valid;
 };
@@ -103,22 +104,42 @@ static void restore_shared_page(u8 *shm, const u8 snapshot[NVFR_SNAP_LEN])
  * Any other result returns at once.
  */
 static int send_doorbell(struct ffa_device *fdev, struct ffa_send_direct_data2 *msg,
-			 s64 *elapsed_us, unsigned int *attempts)
+			 s64 *elapsed_us, s64 *last_us, unsigned int *attempts)
 {
 	ktime_t start = ktime_get();
+	ktime_t attempt_start;
 	int ret;
 
 	*attempts = 0;
 	for (;;) {
 		memset(msg, 0, sizeof(*msg));
 		((u8 *)msg->data)[0] = ESPI_OEM_GENERIC_EMI;
+		attempt_start = ktime_get();
 		ret = fdev->ops->msg_ops->sync_send_receive2(fdev, msg);
 		(*attempts)++;
+		*last_us = ktime_us_delta(ktime_get(), attempt_start);
 		*elapsed_us = ktime_us_delta(ktime_get(), start);
 		if (!nvfr_send_should_retry(ret, *attempts, *elapsed_us))
 			return ret;
 		usleep_range(500, 1000);
 	}
+}
+
+/*
+ * The shared page has no lock: binding the FF-A device is the only exclusion
+ * between nvfanread, nvfancontrol and ec-probe. Refuse to touch the page while
+ * any driver that writes it owns the device. nvidia-ffa-ec never uses the page.
+ */
+static int check_owner(struct ffa_device *fdev)
+{
+	const struct device_driver *owner = READ_ONCE(fdev->dev.driver);
+
+	if (nvfr_owner_allowed(owner ? owner->name : NULL))
+		return 0;
+
+	pr_warn_ratelimited("%s is bound to '%s', which also uses the shared page; not sending\n",
+			    dev_name(&fdev->dev), owner->name);
+	return -EBUSY;
 }
 
 /*
@@ -140,7 +161,12 @@ static int read_telemetry(struct nvfanread_state *state,
 	unsigned int attempts;
 	unsigned int elapsed;
 	s64 elapsed_us;
+	s64 last_us;
 	int ret;
+
+	ret = check_owner(fdev);
+	if (ret)
+		return ret;
 
 	if (nvfr_build_request_frame(frame, sizeof(frame))) {
 		pr_err("internal error: request frame too small\n");
@@ -177,7 +203,7 @@ static int read_telemetry(struct nvfanread_state *state,
 	/* Publish the request frame to the shared page before the doorbell send. */
 	mb();
 
-	ret = send_doorbell(fdev, &msg, &elapsed_us, &attempts);
+	ret = send_doorbell(fdev, &msg, &elapsed_us, &last_us, &attempts);
 	if (ret) {
 		pr_crit("FF-A TRANSPORT FAILURE: ret=%d attempts=%u elapsed=%lld us\n",
 			ret, attempts, elapsed_us);
@@ -187,7 +213,8 @@ static int read_telemetry(struct nvfanread_state *state,
 
 	service_status = get_unaligned_le32((u8 *)msg.data);
 	if (service_status != 0) {
-		if (service_status == 5 && elapsed_us >= ESPI_TIMEOUT_FLOOR_US)
+		/* Time only the final send; retries must not fake a timeout. */
+		if (service_status == 5 && last_us >= ESPI_TIMEOUT_FLOOR_US)
 			pr_crit("eSPI TIMEOUT: internal mailbox operation timed out (status=5)\n");
 		else
 			pr_crit("SERVICE REJECTED: status=%u\n", service_status);
@@ -227,7 +254,7 @@ static int read_telemetry(struct nvfanread_state *state,
 	}
 
 	memcpy(out, &shm[NVFR_TELEMETRY_DATA_OFFSET], NVFR_TELEMETRY_LEN);
-	pr_info("telemetry read OK in <=%u ms (decode via sysfs)\n", elapsed);
+	pr_debug("telemetry read OK in <=%u ms\n", elapsed);
 
 	ret = 0;
 	restore_shared_page(shm, snapshot);
@@ -238,9 +265,10 @@ out_unmap:
 }
 
 /*
- * Return a telemetry snapshot, serialized and lightly cached: a fresh cached
- * copy (< NVFANREAD_CACHE_MS old) is reused; otherwise one EC read is issued and
- * cached. All callers go through here so requests are serialized.
+ * Return a telemetry snapshot, serialized and lightly cached: a result younger
+ * than NVFR_CACHE_US is reused, whether it succeeded or failed; otherwise one
+ * EC read is issued and its result cached. All callers go through here so
+ * requests are serialized.
  */
 static int nvfanread_get_snapshot(struct nvfanread_state *state,
 				  u8 snap[NVFR_TELEMETRY_LEN])
@@ -251,20 +279,21 @@ static int nvfanread_get_snapshot(struct nvfanread_state *state,
 	if (ret)
 		return ret;
 
-	if (state->cache_valid &&
-	    ktime_before(ktime_get(),
-			 ktime_add_ms(state->cache_time, NVFANREAD_CACHE_MS))) {
-		memcpy(snap, state->cache, NVFR_TELEMETRY_LEN);
+	if (nvfr_cache_fresh(state->cache_valid,
+			     ktime_us_delta(ktime_get(), state->cache_time))) {
+		ret = state->cache_ret;
+		if (!ret)
+			memcpy(snap, state->cache, NVFR_TELEMETRY_LEN);
 		mutex_unlock(&state->request_lock);
-		return 0;
+		return ret;
 	}
 
 	ret = read_telemetry(state, snap);
-	if (!ret) {
+	if (!ret)
 		memcpy(state->cache, snap, NVFR_TELEMETRY_LEN);
-		state->cache_time = ktime_get();
-		state->cache_valid = true;
-	}
+	state->cache_ret = ret;
+	state->cache_time = ktime_get();
+	state->cache_valid = true;
 	mutex_unlock(&state->request_lock);
 	return ret;
 }
@@ -396,6 +425,35 @@ static int nvfanread_match_espi(struct device *dev, const void *data)
 	return nvfr_uuid_is_espi(to_ffa_dev(dev)->uuid.b);
 }
 
+/*
+ * Claim driver. Where nothing else binds the eSPI service (6.17, 7.0.0-1019)
+ * it binds the device so nvfancontrol and ec-probe cannot bind and write the
+ * shared page while nvfanread uses it, as 1.0.0 did. On 7.0.0-1025+
+ * nvidia-ffa-ec already holds the device and this never probes. It keeps no
+ * state on the device; the hwmon device does not depend on it.
+ */
+static int nvfanread_claim_probe(struct ffa_device *fdev)
+{
+	pr_info("%s: claimed (mailbox exclusion against other drivers)\n",
+		dev_name(&fdev->dev));
+	return 0;
+}
+
+static const struct ffa_device_id nvfanread_claim_ids[] = {
+	{
+		.uuid = UUID_INIT(0x884a63a0, 0x3285, 0x4120,
+				  0x83, 0xaa, 0xee, 0xc0,
+				  0x08, 0xa0, 0xa5, 0x46),
+	},
+	{},
+};
+
+static struct ffa_driver nvfanread_claim_driver = {
+	.name = NVFR_DRIVER_NAME,
+	.probe = nvfanread_claim_probe,
+	.id_table = nvfanread_claim_ids,
+};
+
 static int __init nvfanread_init(void)
 {
 	struct nvfanread_state *state = &nvfanread_state;
@@ -403,26 +461,36 @@ static int __init nvfanread_init(void)
 	struct ffa_device *fdev;
 	struct device *dev;
 	struct device *hwmon;
+	int ret;
+
+	/* Claim first, so the device is ours before any reader can run. */
+	ret = ffa_driver_register(&nvfanread_claim_driver, THIS_MODULE,
+				  KBUILD_MODNAME);
+	if (ret) {
+		pr_err("claim driver registration failed: %d\n", ret);
+		return ret;
+	}
 
 	dev = bus_find_device(&ffa_bus_type, NULL, NULL, nvfanread_match_espi);
 	if (!dev) {
 		pr_err("FF-A eSPI service 884a63a0-3285-4120-83aa-eec008a0a546 not found on the arm_ffa bus\n");
-		return -ENODEV;
+		ret = -ENODEV;
+		goto err_unregister;
 	}
 	fdev = to_ffa_dev(dev);
 
 	if (!fdev->ops || !fdev->ops->msg_ops ||
 	    !fdev->ops->msg_ops->sync_send_receive2) {
 		pr_err("%s: FF-A Direct Request 2 is unavailable\n", dev_name(dev));
-		put_device(dev);
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		goto err_put;
 	}
 
 	if (fdev->mode_32bit) {
 		pr_err("%s: refusing Direct Request 2 for a 32-bit-mode device\n",
 		       dev_name(dev));
-		put_device(dev);
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		goto err_put;
 	}
 
 	state->fdev = fdev;
@@ -434,18 +502,27 @@ static int __init nvfanread_init(void)
 		pr_err("%s: hwmon registration failed: %ld\n", dev_name(dev),
 		       PTR_ERR(hwmon));
 		state->fdev = NULL;
-		put_device(dev);
-		return PTR_ERR(hwmon);
+		ret = PTR_ERR(hwmon);
+		goto err_put;
 	}
 	state->hwmon = hwmon;
 
-	/* Racy read, for the log only: show who owns the device we share. */
+	/* For the log only: show who owns the device. Reads re-check it. */
 	owner = READ_ONCE(dev->driver);
-	pr_info("%s (partition %#x) is bound to driver '%s'; nvfanread uses it without binding\n",
+	pr_info("%s (partition %#x) is bound to driver '%s'\n",
 		dev_name(dev), fdev->vm_id, owner ? owner->name : "(none)");
+	if (owner && !nvfr_owner_allowed(owner->name))
+		pr_warn("%s: '%s' also uses the shared page; reads return -EBUSY while it is bound\n",
+			dev_name(dev), owner->name);
 	pr_info("read-only fan telemetry ready: hwmon '%s' (fan1_input/fan2_input/telemetry) under %s; module load issued no EC request\n",
 		dev_name(hwmon), dev_name(dev));
 	return 0;
+
+err_put:
+	put_device(dev);
+err_unregister:
+	ffa_driver_unregister(&nvfanread_claim_driver);
+	return ret;
 }
 
 static void __exit nvfanread_exit(void)
@@ -457,6 +534,7 @@ static void __exit nvfanread_exit(void)
 	state->hwmon = NULL;
 	put_device(&state->fdev->dev);
 	state->fdev = NULL;
+	ffa_driver_unregister(&nvfanread_claim_driver);
 }
 
 module_init(nvfanread_init);
