@@ -15,11 +15,16 @@
  * looks the device up on the bus and sends through its ops without owning it.
  * See issue #15.
  *
- * The shared page has no lock; binding the device is the only exclusion
- * between nvfanread, nvfancontrol and ec-probe. So nvfanread also registers a
- * small claim driver: where the device is free (6.17, 7.0.0-1019) it binds,
- * as 1.0.0 did. Each read also checks the current owner and refuses with
- * -EBUSY if a driver that writes the page holds the device.
+ * On 7.0.0-1025+ neither nvfanread nor nvfancontrol can bind the device, so
+ * binding cannot keep them off the shared page at the same time. Each
+ * transaction therefore takes the page as a busy iomem region
+ * (NVFR_MAILBOX_LOCK_NAME), and nvfancontrol builds that do not bind take the
+ * same lock. The module exports nvfanread_mailbox_lock_v1 so nvfancontrol can
+ * tell it from a build without the lock. nvfanread also keeps a small claim
+ * driver: where the device is free (6.17, 7.0.0-1019) it binds. Each read
+ * also checks the current owner and refuses with -EAGAIN if a driver that
+ * binds and writes the page without the lock (the nvfancontrol build that
+ * binds, ec-probe) holds the device.
  *
  * Reading fan RPM issues a single OEM1 command 17 carrying EC inner command 7
  * ("thermal control / fan operation telemetry snapshot"), which the EC
@@ -29,9 +34,9 @@
  *
  * The pure protocol logic lives in nvfanread_proto.h and is unit-tested in
  * userspace; this file adds the FF-A / shared-page I/O around it. The mailbox
- * handshake mirrors the override driver: it refuses a non-idle mailbox,
- * snapshots the shared page, and restores it afterwards. Requests are
- * serialized under a mutex.
+ * handshake mirrors the override driver: it takes the mailbox lock, refuses a
+ * non-idle mailbox, snapshots the shared page, restores it afterwards, and
+ * releases the lock. Requests in this module are serialized under a mutex.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -43,6 +48,7 @@
 #include <linux/errno.h>
 #include <linux/hwmon.h>
 #include <linux/io.h>
+#include <linux/ioport.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/mm.h>
@@ -80,6 +86,8 @@ struct nvfanread_state {
 	int cache_ret;		/* result of the cached read; failures cache too */
 	ktime_t cache_time;
 	bool cache_valid;
+	bool mailbox_poisoned;	/* output timeout: lock held until exit */
+	bool poison_logged;
 };
 
 static struct nvfanread_state nvfanread_state = {
@@ -126,25 +134,87 @@ static int send_doorbell(struct ffa_device *fdev, struct ffa_send_direct_data2 *
 }
 
 /*
- * The shared page has no lock: binding the FF-A device is the only exclusion
- * between nvfanread, nvfancontrol and ec-probe. Refuse to touch the page while
- * any driver that writes it owns the device. nvidia-ffa-ec never uses the page.
+ * Marker for nvfancontrol: its presence says this nvfanread takes the mailbox
+ * lock. nvfancontrol looks it up with __symbol_get(), so it does not depend on
+ * this module. Must be GPL: __symbol_get() refuses other symbols.
+ */
+const int nvfanread_mailbox_lock_v1 = 1;
+EXPORT_SYMBOL_GPL(nvfanread_mailbox_lock_v1);
+
+/*
+ * Take the shared page as a busy iomem region for one transaction. This is the
+ * lock between nvfanread and nvfancontrol: both request the same region, and
+ * the kernel grants it to one caller at a time. Retry a busy region until the
+ * deadline in nvfanread_proto.h, then give up with -EAGAIN (nothing sent).
+ * Never hold it across module lifetime, or the other module could never send.
+ * The only exception is a poisoned mailbox (see read_telemetry()).
+ */
+static int mailbox_lock(void)
+{
+	ktime_t start = ktime_get();
+
+	for (;;) {
+		if (request_mem_region(ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE,
+				       NVFR_MAILBOX_LOCK_NAME))
+			return 0;
+		if (!nvfr_lock_should_retry(ktime_us_delta(ktime_get(), start)))
+			break;
+		usleep_range(1000, 2000);
+	}
+
+	pr_warn_ratelimited("mailbox lock %#llx busy for %lld ms; nothing sent\n",
+			    ESPI_NS_SHM_PA, NVFR_LOCK_RETRY_BUDGET_US / 1000);
+	return -EAGAIN;
+}
+
+static void mailbox_unlock(void)
+{
+	release_mem_region(ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE);
+}
+
+/*
+ * The mailbox lock keeps locking builds of nvfancontrol off the page. A driver
+ * that binds the device and writes the page without the lock (the nvfancontrol
+ * build that binds, ec-probe) must not own the device, so refuse while one
+ * does. nvidia-ffa-ec never uses the page.
+ *
+ * Read the owner's name under the device lock so the driver cannot unbind
+ * (and its name go away) while we compare it. The driver core holds this lock
+ * only for bind, unbind and probe; the claim driver's probe and unbind never
+ * take request_lock or wait on a sysfs reader, so this cannot deadlock.
  */
 static int check_owner(struct ffa_device *fdev)
 {
-	const struct device_driver *owner = READ_ONCE(fdev->dev.driver);
+	const struct device_driver *owner;
+	char name[32] = "";
+	bool allowed;
 
-	if (nvfr_owner_allowed(owner ? owner->name : NULL))
+	device_lock(&fdev->dev);
+	owner = fdev->dev.driver;
+	if (owner)
+		strscpy(name, owner->name, sizeof(name));
+	allowed = nvfr_owner_allowed(owner ? name : NULL);
+	device_unlock(&fdev->dev);
+
+	if (allowed)
 		return 0;
 
-	pr_warn_ratelimited("%s is bound to '%s', which also uses the shared page; not sending\n",
-			    dev_name(&fdev->dev), owner->name);
-	return -EBUSY;
+	pr_warn_ratelimited("%s is bound to '%s', which also uses the shared page; nothing sent\n",
+			    dev_name(&fdev->dev), name);
+	return -EAGAIN;
 }
 
 /*
  * Issue EC command 7 and copy the 64-byte telemetry snapshot into @out.
  * Returns 0 on success. Never writes an override slot.
+ *
+ * Error codes follow nvfanread_proto.h: -EAGAIN means nothing was sent.
+ *
+ * After an output timeout the EC may still be working on the request, so the
+ * handshake bytes are left as they are (no restore to idle), the mailbox lock
+ * stays held, and the mailbox is poisoned: every later read returns
+ * -ENOTRECOVERABLE and nvfancontrol cannot take the lock. Unloading nvfanread
+ * releases it. The EC may then need the cold power drain from #10.
  */
 static int read_telemetry(struct nvfanread_state *state,
 			  u8 out[NVFR_TELEMETRY_LEN])
@@ -158,11 +228,22 @@ static int read_telemetry(struct nvfanread_state *state,
 	u32 service_status;
 	bool map_memory;
 	bool reserved_page = false;
+	bool ready = false;
 	unsigned int attempts;
-	unsigned int elapsed;
+	ktime_t poll_start;
+	ktime_t deadline;
+	s64 waited_ms;
 	s64 elapsed_us;
 	s64 last_us;
 	int ret;
+
+	if (state->mailbox_poisoned) {
+		if (!state->poison_logged) {
+			pr_crit("mailbox poisoned by an earlier output timeout; refusing all reads until nvfanread is unloaded\n");
+			state->poison_logged = true;
+		}
+		return -ENOTRECOVERABLE;
+	}
 
 	ret = check_owner(fdev);
 	if (ret)
@@ -179,14 +260,19 @@ static int read_telemetry(struct nvfanread_state *state,
 
 	if (map_memory && !reserved_page) {
 		pr_err("refusing ns_shm0: PFN is Linux map memory but is not marked reserved\n");
-		return -EPERM;
+		return -EAGAIN;
 	}
 
+	/* Map outside the lock, so the lock covers only the mailbox exchange. */
 	shm = memremap(ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE, MEMREMAP_WB);
 	if (!shm) {
 		pr_err("memremap of manifest ns_shm0 failed\n");
-		return -ENOMEM;
+		return -EAGAIN;
 	}
+
+	ret = mailbox_lock();
+	if (ret)
+		goto out_unmap;
 
 	memcpy(snapshot, shm, sizeof(snapshot));
 
@@ -195,8 +281,8 @@ static int read_telemetry(struct nvfanread_state *state,
 		pr_err("refusing request: shared mailbox is not idle (accepted=%#04x ready=%#04x)\n",
 			snapshot[NVFR_FRAME_INPUT_ACCEPTED],
 			snapshot[NVFR_FRAME_OUTPUT_READY]);
-		ret = -EBUSY;
-		goto out_unmap;
+		ret = -EAGAIN;
+		goto out_unlock;
 	}
 
 	memcpy(shm, frame, sizeof(frame));
@@ -207,8 +293,9 @@ static int read_telemetry(struct nvfanread_state *state,
 	if (ret) {
 		pr_crit("FF-A TRANSPORT FAILURE: ret=%d attempts=%u elapsed=%lld us\n",
 			ret, attempts, elapsed_us);
+		ret = nvfr_doorbell_errno(ret);
 		restore_shared_page(shm, snapshot);
-		goto out_unmap;
+		goto out_unlock;
 	}
 
 	service_status = get_unaligned_le32((u8 *)msg.data);
@@ -219,24 +306,35 @@ static int read_telemetry(struct nvfanread_state *state,
 		else
 			pr_crit("SERVICE REJECTED: status=%u\n", service_status);
 
-		ret = service_status == 10 ? -EBUSY : -EIO;
+		ret = nvfr_service_status_errno(service_status);
 		restore_shared_page(shm, snapshot);
-		goto out_unmap;
+		goto out_unlock;
 	}
 
-	for (elapsed = 0; elapsed < REPLY_TIMEOUT_MS; elapsed += REPLY_POLL_MS) {
-		if (READ_ONCE(shm[NVFR_FRAME_OUTPUT_READY]) == 1)
+	poll_start = ktime_get();
+	deadline = ktime_add_ms(poll_start, REPLY_TIMEOUT_MS);
+	for (;;) {
+		if (READ_ONCE(shm[NVFR_FRAME_OUTPUT_READY]) == 1) {
+			ready = true;
+			break;
+		}
+		if (ktime_after(ktime_get(), deadline))
 			break;
 		msleep(REPLY_POLL_MS);
 	}
+	waited_ms = ktime_ms_delta(ktime_get(), poll_start);
 
-	if (READ_ONCE(shm[NVFR_FRAME_OUTPUT_READY]) != 1) {
-		pr_crit("OUTPUT TIMEOUT after %u ms: accepted=%#04x ready=%#04x\n",
-			 REPLY_TIMEOUT_MS,
-			 READ_ONCE(shm[NVFR_FRAME_INPUT_ACCEPTED]),
-			 READ_ONCE(shm[NVFR_FRAME_OUTPUT_READY]));
+	if (!ready) {
+		pr_crit("OUTPUT TIMEOUT after %lld ms: accepted=%#04x ready=%#04x; mailbox poisoned and lock kept until nvfanread is unloaded\n",
+			waited_ms,
+			READ_ONCE(shm[NVFR_FRAME_INPUT_ACCEPTED]),
+			READ_ONCE(shm[NVFR_FRAME_OUTPUT_READY]));
+		/*
+		 * Do not restore: that would mark the mailbox idle while the EC
+		 * may still write it. Keep the region held as the guard.
+		 */
+		state->mailbox_poisoned = true;
 		ret = -ETIMEDOUT;
-		restore_shared_page(shm, snapshot);
 		goto out_unmap;
 	}
 
@@ -250,15 +348,17 @@ static int read_telemetry(struct nvfanread_state *state,
 			 shm[NVFR_FRAME_DATA_OFFSET + 2]);
 		ret = -EPROTO;
 		restore_shared_page(shm, snapshot);
-		goto out_unmap;
+		goto out_unlock;
 	}
 
 	memcpy(out, &shm[NVFR_TELEMETRY_DATA_OFFSET], NVFR_TELEMETRY_LEN);
-	pr_debug("telemetry read OK in <=%u ms\n", elapsed);
+	pr_debug("telemetry read OK in <=%lld ms\n", waited_ms);
 
 	ret = 0;
 	restore_shared_page(shm, snapshot);
 
+out_unlock:
+	mailbox_unlock();
 out_unmap:
 	memunmap(shm);
 	return ret;
@@ -427,8 +527,9 @@ static int nvfanread_match_espi(struct device *dev, const void *data)
 
 /*
  * Claim driver. Where nothing else binds the eSPI service (6.17, 7.0.0-1019)
- * it binds the device so nvfancontrol and ec-probe cannot bind and write the
- * shared page while nvfanread uses it, as 1.0.0 did. On 7.0.0-1025+
+ * it binds the device so drivers that bind and write the shared page without
+ * the mailbox lock (the nvfancontrol build that binds, ec-probe) cannot
+ * attach while nvfanread uses it. On 7.0.0-1025+
  * nvidia-ffa-ec already holds the device and this never probes. It keeps no
  * state on the device; the hwmon device does not depend on it.
  */
@@ -462,6 +563,19 @@ static int __init nvfanread_init(void)
 	struct device *dev;
 	struct device *hwmon;
 	int ret;
+
+	/*
+	 * The shared page must be firmware memory, never System RAM: the
+	 * mailbox lock nests under a non-busy "reserved" region, and a page
+	 * the kernel can allocate must not be written behind its back.
+	 */
+	if (region_intersects(ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE,
+			      IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE) !=
+	    REGION_DISJOINT) {
+		pr_err("shared page %#llx overlaps System RAM in /proc/iomem; refusing to load\n",
+		       ESPI_NS_SHM_PA);
+		return -EINVAL;
+	}
 
 	/* Claim first, so the device is ours before any reader can run. */
 	ret = ffa_driver_register(&nvfanread_claim_driver, THIS_MODULE,
@@ -512,7 +626,7 @@ static int __init nvfanread_init(void)
 	pr_info("%s (partition %#x) is bound to driver '%s'\n",
 		dev_name(dev), fdev->vm_id, owner ? owner->name : "(none)");
 	if (owner && !nvfr_owner_allowed(owner->name))
-		pr_warn("%s: '%s' also uses the shared page; reads return -EBUSY while it is bound\n",
+		pr_warn("%s: '%s' also uses the shared page; reads return -EAGAIN while it is bound\n",
 			dev_name(dev), owner->name);
 	pr_info("read-only fan telemetry ready: hwmon '%s' (fan1_input/fan2_input/telemetry) under %s; module load issued no EC request\n",
 		dev_name(hwmon), dev_name(dev));
@@ -535,6 +649,11 @@ static void __exit nvfanread_exit(void)
 	put_device(&state->fdev->dev);
 	state->fdev = NULL;
 	ffa_driver_unregister(&nvfanread_claim_driver);
+	/* A poisoned mailbox kept the lock; only unload releases it. */
+	if (state->mailbox_poisoned) {
+		mailbox_unlock();
+		pr_warn("released the poisoned mailbox lock; the EC may need a cold power drain (#10)\n");
+	}
 }
 
 module_init(nvfanread_init);

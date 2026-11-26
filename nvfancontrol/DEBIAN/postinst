@@ -77,7 +77,7 @@ remove_current_manual_module() {
     rmdir "$state_dir" 2>/dev/null || true
 }
 
-exec 9>/run/lock/nvfancontrol.lock
+exec 9>/run/nvfancontrol.lock
 flock 9
 
 if command -v dkms >/dev/null 2>&1 && [ -x "$common_postinst" ]; then

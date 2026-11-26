@@ -46,20 +46,43 @@ nvfanread: arm-ffa-17 (partition 0x8003) is bound to driver 'nvidia-ffa-ec'
 
 ## One mailbox user at a time
 
-The shared page has no lock. Binding `arm-ffa-17` is the only thing that stops
-`nvfanread`, `nvfancontrol` and the `ec-probe` tool from writing it at the same
-time.
+On 7.0.0-1025 and later neither `nvfanread` nor `nvfancontrol` can bind
+`arm-ffa-17`, so binding cannot keep them off the shared page at the same time.
+Both modules therefore take a mailbox lock for each request: they call
+`request_mem_region()` on the shared page (`0x933dd000`, size `0x1000`, name
+`nvfan-mailbox`). The kernel grants the region to one caller at a time. The
+lock covers the whole request: snapshot, frame write, doorbell, reply and
+restore. If the other module holds it, `nvfanread` tries again for up to 50 ms,
+then the read returns `-EAGAIN` (nothing was sent). Neither module holds the
+lock between requests, so both can stay loaded. `nvfancontrol` waits up to 8 s
+for the lock, longer than the longest `nvfanread` request.
+
+If the EC does not answer within 5 s, `nvfanread` poisons the mailbox: it keeps
+the lock, leaves the handshake bytes as they are (the EC may still be working),
+and every later read returns `-ENOTRECOVERABLE`. Unloading `nvfanread` releases
+the lock. The EC may then need the cold power drain from #10.
+
+`nvfanread` exports the symbol `nvfanread_mailbox_lock_v1`. `nvfancontrol` uses
+it to tell this build from an `nvfanread` without the lock, which it then
+refuses to run next to.
+
+The build of `nvfancontrol` that binds the device (1.0.0) does not take the
+lock. The `ec-probe` tool takes the lock but also binds the device. The
+binding still excludes both:
 
 - **6.17.0-1032 and 7.0.0-1019:** nothing else binds the device, so `nvfanread`
-  binds it with a small claim driver, as 1.0.0 did. While it is loaded,
-  `nvfancontrol` and `ec-probe` cannot bind. If one of them bound first,
-  `nvfanread` still loads, but each read returns `-EBUSY` and logs a warning.
+  binds it with a small claim driver. While it is loaded, that
+  `nvfancontrol` build and `ec-probe` cannot bind. If one of them bound first,
+  `nvfanread` still loads, but each read returns `-EAGAIN` and logs a warning.
 - **7.0.0-1025 and later:** `nvidia-ffa-ec` holds the device, so neither
-  `nvfancontrol` nor `ec-probe` can bind, and `nvfanread` is the only mailbox
-  user.
+  that `nvfancontrol` build nor `ec-probe` can bind.
 
 Before each read `nvfanread` checks who owns the device. It sends only when the
 device is unbound, or bound to `nvidia-ffa-ec` or to `nvfanread`.
+
+Install `nvfanread` and `nvfancontrol` from the same release. Builds without the
+lock (`nvfanread` 1.0.0 and the build from #17) do not export the marker
+symbol, so `nvfancontrol` refuses to send while one is loaded.
 
 The secure partition also serves other EC services. It answers "busy" when
 another request is in flight, so `nvfanread` retries a busy send for up to
@@ -74,8 +97,9 @@ system.
 
 - **Read-only by construction.** The request builder can emit only command 7;
   there is no code path to an override write. This is asserted by a unit test.
-- Refuses a non-idle mailbox, snapshots the shared page, and restores it around
-  every request. Requests are serialized under a mutex.
+- Takes the mailbox lock, refuses a non-idle mailbox, snapshots the shared
+  page, and restores it around every request. Requests in the module are
+  serialized under a mutex.
 - Loading the module issues **no** EC request; a request happens only when the
   `telemetry` sysfs attribute is read.
 

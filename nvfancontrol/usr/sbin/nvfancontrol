@@ -4,7 +4,8 @@ set -euo pipefail
 
 expected_uuid='884a63a0-3285-4120-83aa-eec008a0a546'
 ffa_device='/sys/bus/arm_ffa/devices/arm-ffa-17'
-fan_path="$ffa_device/fan"
+# The module does not bind the FF-A device; the attribute lives on a faux device.
+fan_path='/sys/devices/faux/nvfancontrol/fan'
 module='nvfancontrol'
 
 usage() {
@@ -33,12 +34,20 @@ module_is_loaded() {
     grep -q "^${module} " /proc/modules 2>/dev/null
 }
 
+ffa_owner() {
+    if [ -L "$ffa_device/driver" ]; then
+        basename "$(readlink "$ffa_device/driver")"
+    else
+        printf '(none)\n'
+    fi
+}
+
 if [ "$(id -u)" -ne 0 ]; then
     printf 'Run this command as root.\n' >&2
     exit 1
 fi
 
-exec 9>/run/lock/nvfancontrol.lock
+exec 9>/run/nvfancontrol.lock
 if ! flock -n 9; then
     printf 'Another nvfancontrol operation is already running.\n' >&2
     exit 1
@@ -78,18 +87,15 @@ if [ "$action" = 'status' ]; then
         exit 1
     fi
     printf 'Module: loaded\n'
-    printf 'Driver: %s\n' "$(readlink "$ffa_device/driver")"
+    printf 'FF-A device driver: %s\n' "$(ffa_owner)"
     printf 'Fan: %s\n' "$(tr -d '\r\n' < "$fan_path")"
     exit 0
 fi
 
 if ! module_is_loaded; then
-    if [ -L "$ffa_device/driver" ]; then
-        printf 'Refusing to continue: %s is already bound to %s\n' \
-            "$ffa_device" "$(readlink "$ffa_device/driver")" >&2
-        exit 1
-    fi
-
+    # The module never binds the FF-A device, so another driver may own it
+    # (nvidia-ffa-ec on 7.0.0-1025+, nvfanread on older kernels). The module
+    # checks the owner and takes the mailbox lock before each request.
     kernel_release="$(uname -r)"
     module_path="$(modinfo -n "$module" 2>/dev/null || true)"
     if [ -z "$module_path" ] || [ ! -r "$module_path" ]; then
@@ -130,23 +136,32 @@ if ! module_is_loaded; then
     fi
 fi
 
-if [ ! -L "$ffa_device/driver" ] ||
-        [ "$(basename "$(readlink "$ffa_device/driver")")" != "$module" ]; then
-    printf 'Refusing to write: %s is not bound to the nvfancontrol driver.\n' \
-        "$ffa_device" >&2
-    exit 1
-fi
-
 if [ ! -w "$fan_path" ]; then
     printf 'Fan interface is not writable: %s\n' "$fan_path" >&2
     exit 1
 fi
 
-if ! printf '%s\n' "$action" > "$fan_path"; then
+# "error -11" (EAGAIN) means the module sent nothing to the EC: the mailbox
+# was busy or a check refused the request. That is safe to retry. Any other
+# error means the request may have reached the EC.
+tries=0
+while ! printf '%s\n' "$action" > "$fan_path"; do
+    state="$(tr -d '\r\n' < "$fan_path")"
+    tries=$((tries + 1))
+    if [ "$state" = 'error -11' ]; then
+        if [ "$tries" -le 3 ]; then
+            printf 'Mailbox busy; nothing was sent. Retry %s of 3 in 1 s.\n' \
+                "$tries" >&2
+            sleep 1
+            continue
+        fi
+        printf 'Nothing was sent; the EC keeps its previous setting; safe to retry.\n' >&2
+        exit 75
+    fi
     printf 'The sysfs write failed; EC override state is unknown. Do not retry blindly.\n' >&2
-    printf 'Fan state: %s\n' "$(tr -d '\r\n' < "$fan_path")" >&2
+    printf 'Fan state: %s\n' "$state" >&2
     exit 1
-fi
+done
 
 after="$(tr -d '\r\n' < "$fan_path")"
 if [ "$after" != "$action" ]; then

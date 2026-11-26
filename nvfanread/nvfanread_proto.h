@@ -208,14 +208,78 @@ static inline int nvfr_send_should_retry(int ret, unsigned int attempts,
 }
 
 /*
+ * Cross-module mailbox lock. nvfanread and nvfancontrol each take the shared
+ * page as a busy iomem region (request_mem_region) for one whole transaction:
+ * snapshot, frame write, doorbell, reply, restore. The page sits inside a
+ * non-busy "reserved" firmware region, so the first request nests under it
+ * and a second request for the same page fails until the first is released.
+ * The kernel matches the region by address and size only; the name shows in
+ * /proc/iomem. The address and size must match ESPI_NS_SHM_PA/ESPI_NS_SHM_SIZE
+ * in nvfancontrol.c; scripts/check-mailbox-lock.sh checks this.
+ *
+ * nvfanread waits for a busy region until a deadline NVFR_LOCK_RETRY_BUDGET_US
+ * after the first try, then returns -EAGAIN. The reader is polled often, so
+ * the wait stays short. nvfancontrol waits much longer (see nvfancontrol.c).
+ */
+#define NVFR_MAILBOX_LOCK_NAME      "nvfan-mailbox"
+#define NVFR_LOCK_RETRY_BUDGET_US   50000LL
+
+/*
+ * Return 1 if the caller should try the region again. @elapsed_us is the time
+ * since the first try. A clock that went back stops the wait.
+ */
+static inline int nvfr_lock_should_retry(long long elapsed_us)
+{
+	return elapsed_us >= 0 && elapsed_us < NVFR_LOCK_RETRY_BUDGET_US;
+}
+
+/*
+ * Exported by every nvfanread build that takes the mailbox lock. nvfancontrol
+ * looks it up with __symbol_get() to tell a locking nvfanread from a build
+ * without the lock (nvfanread 1.0.0 and the build from #17), which it cannot
+ * see in the owner check. The value is not used.
+ */
+#define NVFR_LOCK_MARKER_SYMBOL     "nvfanread_mailbox_lock_v1"
+
+/*
+ * Error codes, the same in nvfanread and nvfancontrol:
+ *   -EAGAIN           nothing was sent to the EC; safe to try again
+ *   -ENOTRECOVERABLE  an earlier request timed out; the mailbox is poisoned
+ *                     until the module is unloaded
+ * Every other error after the doorbell leaves the EC state unknown.
+ *
+ * Map the final doorbell result. FF-A BUSY after all retries means the
+ * partition did not take the request, so nothing was sent: -EAGAIN. A
+ * transport -EAGAIN (FFA_RET_RETRY / NOT_READY) is not proof of that, so it
+ * becomes -EIO: -EAGAIN must only ever mean "nothing sent".
+ */
+static inline int nvfr_doorbell_errno(int ret)
+{
+	if (ret == -EBUSY)
+		return -EAGAIN;
+	if (ret == -EAGAIN)
+		return -EIO;
+	return ret;
+}
+
+/* Map a non-zero service status after delivery. Never -EAGAIN. */
+static inline int nvfr_service_status_errno(unsigned int status)
+{
+	return status == 10 ? -EBUSY : -EIO;
+}
+
+/*
  * Driver names allowed to own the FF-A device while nvfanread uses the shared
- * page. The page has no lock; binding the device is the only exclusion.
+ * page. The mailbox lock above excludes builds that take it; this check also
+ * refuses drivers that bind the device and write the page without the lock.
  *   NULL           - unbound (nvfanread's own driver lost the race or was
  *                    unbound; nothing else is writing the page)
  *   nvidia-ffa-ec  - the built-in driver on 7.0.0-1025+; it forwards ACPI FFH
  *                    requests in registers and never uses the page
  *   nvfanread      - our own claim driver (6.17 / 7.0.0-1019)
- * Anything else (nvfancontrol, ec-probe's nvfanprobe) writes the page itself.
+ * Anything else is refused: the nvfancontrol build that binds the device
+ * (nvfancontrol 1.0.0, which has no mailbox lock) and, to be safe, any other
+ * driver. ec-probe's nvfanprobe binds too.
  */
 #define NVFR_DRIVER_NAME            "nvfanread"
 #define NVFR_NVIDIA_EC_DRIVER_NAME  "nvidia-ffa-ec"
