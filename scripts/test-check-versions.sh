@@ -13,7 +13,8 @@ files="packaging/nvfanread/DEBIAN/control nvfanread/dkms.conf \
 	scripts/build-nvfanread-deb.sh nvfanread/nvfanread.c \
 	nvfancontrol/DEBIAN/control nvfancontrol/DEBIAN/postinst \
 	nvfancontrol/DEBIAN/prerm nvfancontrol/DEBIAN/postrm \
-	nvfancontrol/usr/src/nvfancontrol/dkms.conf scripts/build-debs.sh"
+	nvfancontrol/usr/src/nvfancontrol/dkms.conf scripts/build-debs.sh \
+	nvfancontrol/usr/src/nvfancontrol/nvfancontrol.c"
 
 fresh_copy() {
 	dir="$(mktemp -d)"
@@ -77,6 +78,23 @@ rm -rf "$dir"
 dir="$(fresh_copy)"
 sed -i '/^module_version=/d' "$dir/nvfancontrol/DEBIAN/postrm"
 expect fail "missing nvfancontrol postrm module_version is caught" "$dir"
+rm -rf "$dir"
+
+# A second MODULE_VERSION, in nvfanread.c or in another shipped .c file,
+# must be checked too, not only the first one found.
+dir="$(fresh_copy)"
+printf 'MODULE_VERSION("9.9.9");\n' >> "$dir/nvfanread/nvfanread.c"
+expect fail "a second MODULE_VERSION in nvfanread.c is caught" "$dir"
+rm -rf "$dir"
+
+dir="$(fresh_copy)"
+printf 'MODULE_VERSION("9.9.9");\n' >> "$dir/nvfancontrol/usr/src/nvfancontrol/nvfancontrol.c"
+expect fail "a MODULE_VERSION in nvfancontrol.c is caught" "$dir"
+rm -rf "$dir"
+
+dir="$(fresh_copy)"
+printf 'MODULE_VERSION("9.9.9");\n' > "$dir/nvfanread/extra.c"
+expect fail "a MODULE_VERSION in a new nvfanread .c file is caught" "$dir"
 rm -rf "$dir"
 
 if [ "$fails" -eq 0 ]; then

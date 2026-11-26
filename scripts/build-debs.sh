@@ -10,7 +10,8 @@
 #
 # The script copies each tree to a temp staging dir and stamps the version
 # there: DEBIAN/control Version, module_version='...' in the maintainer
-# scripts, and PACKAGE_VERSION in usr/src/*/dkms.conf. It never edits tracked
+# scripts, PACKAGE_VERSION in usr/src/*/dkms.conf, and every MODULE_VERSION
+# in usr/src/*/*.c. It never edits tracked
 # files. `scripts/release.py verify` checks the result.
 #
 # The packages are DKMS source packages: dpkg-deb just archives the tree, so
@@ -50,6 +51,10 @@ for ctrl in */DEBIAN/control; do
 	for s in postinst prerm postrm; do
 		[ -f "$tree/DEBIAN/$s" ] || continue
 		sed -i "s/^module_version='.*'\$/module_version='$ver'/" "$tree/DEBIAN/$s"
+	done
+	for c in "$tree"/usr/src/*/*.c; do
+		[ -f "$c" ] || continue
+		sed -i "s/MODULE_VERSION(\"[^\"]*\")/MODULE_VERSION(\"$ver\")/g" "$c"
 	done
 	for conf in "$tree"/usr/src/*/dkms.conf; do
 		[ -f "$conf" ] || continue

@@ -46,6 +46,17 @@ check nvfancontrol/usr/src/nvfancontrol/dkms.conf 's/^PACKAGE_VERSION="\(.*\)"$/
 # shellcheck disable=SC2016  # a literal ${1:-...} in a sed pattern, not an expansion
 check scripts/build-debs.sh 's/^ver="\${1:-\(.*\)}"$/\1/p'
 
+# Every MODULE_VERSION in every shipped .c file of both packages, not only
+# the first one in nvfanread.c.
+for f in "$root"/nvfanread/*.c "$root"/nvfancontrol/usr/src/nvfancontrol/*.c; do
+	[ -f "$f" ] || continue
+	bad="$(grep -o 'MODULE_VERSION("[^"]*")' "$f" | grep -Fvx "MODULE_VERSION(\"$want\")")"
+	if [ -n "$bad" ]; then
+		echo "check-versions: ${f#"$root"/} has $bad, want the placeholder $want" >&2
+		status=1
+	fi
+done
+
 if [ "$status" -eq 0 ]; then
 	echo "check-versions: every in-tree version is the placeholder $want"
 fi

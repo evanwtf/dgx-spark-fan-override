@@ -186,3 +186,32 @@ def test_dpkg_deb_is_present() -> None:
     # The verify step needs dpkg-deb; CI (ubuntu-latest) has it. Fail loudly
     # rather than skip if it is missing.
     assert shutil.which("dpkg-deb")
+
+
+@pytest.mark.parametrize(
+    ("package", "member"),
+    [
+        ("nvfanread", "usr/src/nvfanread-1.1.0/nvfanread.c"),
+        ("nvfancontrol", "usr/src/nvfancontrol/nvfancontrol.c"),
+    ],
+)
+def test_a_second_module_version_is_checked(
+    debs_110: list[Path], tmp_path: Path, package: str, member: str
+) -> None:
+    """Every MODULE_VERSION in every shipped .c file counts, not only the first."""
+    src = next(d for d in debs_110 if d.name.startswith(package + "_"))
+    tree = tmp_path / "tree"
+    subprocess.run(
+        ["dpkg-deb", "-R", str(src), str(tree)], check=True, capture_output=True
+    )
+    path = tree / member
+    path.write_text(path.read_text() + 'MODULE_VERSION("0.0.0");\n')
+    bad = tmp_path / src.name
+    subprocess.run(
+        ["dpkg-deb", "--root-owner-group", "--build", str(tree), str(bad)],
+        check=True,
+        capture_output=True,
+    )
+    others = [d for d in debs_110 if d != src]
+    with pytest.raises(ReleaseError, match=r"MODULE_VERSION 0\.0\.0"):
+        release.verify_debs([*others, bad], release.Version.parse("1.1.0"))

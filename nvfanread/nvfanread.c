@@ -662,5 +662,5 @@ module_exit(nvfanread_exit);
 MODULE_DESCRIPTION("DGX Spark read-only EC fan telemetry probe");
 MODULE_AUTHOR("Evan Hoffman");
 MODULE_LICENSE("GPL");
-/* 0.0.0 is the in-tree placeholder; release builds stamp the tag version. */
+/* Stamped at build time from the release tag; 0.0.0 marks an untagged build. */
 MODULE_VERSION("0.0.0");

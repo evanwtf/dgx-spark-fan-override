@@ -10,9 +10,9 @@
 #            v* tag it is about to create.
 #   outdir   where the .deb goes (default dist)
 #
-# The version is stamped into the staging copy only (control Version,
-# version= in postinst/prerm, PACKAGE_VERSION in dkms.conf, MODULE_VERSION in
-# nvfanread.c). This script never edits tracked files.
+# The version is stamped into the staging copy only: control Version,
+# version= in postinst/prerm, PACKAGE_VERSION in dkms.conf, and every
+# MODULE_VERSION in the .c files. This script never edits tracked files.
 # `scripts/release.py verify` checks the result.
 set -eu
 
@@ -46,7 +46,9 @@ mkdir -p "$src"
 cp nvfanread/nvfanread.c nvfanread/nvfanread_proto.h nvfanread/Makefile \
    nvfanread/dkms.conf "$src/"
 sed -i "s/^PACKAGE_VERSION=\".*\"\$/PACKAGE_VERSION=\"$ver\"/" "$src/dkms.conf"
-sed -i "s/^MODULE_VERSION(\".*\");\$/MODULE_VERSION(\"$ver\");/" "$src/nvfanread.c"
+for c in "$src"/*.c; do
+	sed -i "s/MODULE_VERSION(\"[^\"]*\")/MODULE_VERSION(\"$ver\")/g" "$c"
+done
 
 # Runtime config: boot auto-load + sensors labels.
 mkdir -p "$stage/lib/modules-load.d" "$stage/etc/sensors.d"
