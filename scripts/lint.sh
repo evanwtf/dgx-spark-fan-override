@@ -84,9 +84,10 @@ fi
 sh scripts/check-mailbox-lock.sh || status=1
 sh scripts/test-check-mailbox-lock.sh || status=1
 
-# ---- Version pin: every nvfanread version declaration must agree ----------
-# Runs in CI with the lint job. The self-test proves the check fails on a
-# mismatch, so a broken check cannot pass silently.
+# ---- Version pin: every in-tree version declaration is 0.0.0 -------------
+# Both packages carry the placeholder; the release build stamps the tag
+# version. The self-test proves the check fails on a hand bump, so a broken
+# check cannot pass silently.
 echo "== version pin =="
 sh scripts/check-versions.sh || status=1
 sh scripts/test-check-versions.sh || status=1

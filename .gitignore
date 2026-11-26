@@ -18,3 +18,7 @@ signing_key*
 
 # Signed test builds of the modules (kept local, never committed).
 /signed/
+
+# Python tooling (uv)
+.venv/
+__pycache__/

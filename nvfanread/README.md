@@ -82,15 +82,18 @@ device is unbound, or bound to `nvidia-ffa-ec` or to `nvfanread`.
 
 Install `nvfanread` and `nvfancontrol` from the same release. Builds without the
 lock (`nvfanread` 1.0.0 and the build from #17) do not export the marker
-symbol, so `nvfancontrol` refuses to send while one is loaded.
+symbol, so `nvfancontrol` refuses to send while one is loaded. The hand-made
+build from #17 also reports version 1.1.0, the same as the first release, so
+check for the symbol, not the version:
+`grep -w nvfanread_mailbox_lock_v1 /proc/kallsyms`.
 
 The secure partition also serves other EC services. It answers "busy" when
 another request is in flight, so `nvfanread` retries a busy send for up to
 10 ms (20 tries), as `nvidia-ffa-ec` does. Each result, good or bad, is cached
 for 200 ms, so a tight reader loop cannot flood the partition.
 
-If the FF-A device is missing, 1.1.0 fails to load with `-ENODEV` (1.0.0 loaded
-and stayed unbound), so `systemd-modules-load` reports a failure on such a
+If the FF-A device is missing, `nvfanread` (the #17 build and later) fails to
+load with `-ENODEV` (1.0.0 loaded and stayed unbound), so `systemd-modules-load` reports a failure on such a
 system.
 
 ## Safety
@@ -136,17 +139,35 @@ package. Under Secure Boot, first point DKMS's signing at a MOK you've enrolled
 # one-time: configure DKMS to sign with your enrolled MOK
 sudo scripts/setup-signing.sh ~/.mok/nvfanread-mok.priv ~/.mok/nvfanread-mok.der
 
-# build + install the package (needs dkms)
+# install the package (needs dkms): download nvfanread_<version>_arm64.deb
+# from https://github.com/evanwtf/dgx-spark-fan-override/releases
 sudo apt-get install -y dkms
+sudo dpkg -i nvfanread_*_arm64.deb
+```
+
+A local build of the current tree is a test build at the placeholder version
+`0.0.0`:
+
+```sh
 sh scripts/build-nvfanread-deb.sh
-sudo dpkg -i dist/nvfanread_1.1.0_arm64.deb
+```
+
+To reproduce a release, check out its tag first, then pass the same version.
+Never build a release version from any other commit:
+
+```sh
+export VERSION=1.1.0
+git checkout "v$VERSION"
+sh scripts/build-nvfanread-deb.sh "$VERSION"
+sudo dpkg -i "dist/nvfanread_${VERSION}_arm64.deb"
 ```
 
 The package registers the module with DKMS (built + signed on install and on
 every kernel update), drops `/lib/modules-load.d/nvfanread.conf` for boot
-auto-load, and installs `sensors` labels. Verify with `sensors nvfanread-*`. A
-prebuilt `.deb` is also attached to GitHub Releases (and to each `package` CI
-run's artifacts).
+auto-load, and installs `sensors` labels. Verify with `sensors nvfanread-*`. Every
+merge to `main` attaches the `.deb` to a GitHub Release (see the top-level
+README, "Releases"). Each `package` CI run also keeps a `0.0.0` test build for
+3 days.
 
 ## Usage (once loaded)
 

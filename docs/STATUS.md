@@ -75,14 +75,15 @@ picks it up automatically.
   on kernel updates (`AUTOINSTALL=yes`). Installed and verified on the box.
 - **#4** — friendlier `sensors` labels ("Fan 0" / "Fan 1") ship in the package.
 - Downloadable `.deb` — built + uploaded by the `package` CI job on every
-  push/PR; attached to GitHub Releases on tag.
+  push/PR (placeholder version 0.0.0). Every merge to `main` publishes a
+  GitHub Release with both `.deb`s; see README "Releases".
 
 Install (one-time signing setup, then the package):
 ```sh
 sudo scripts/setup-signing.sh ~/.mok/nvfanread-mok.priv ~/.mok/nvfanread-mok.der
 sudo apt-get install -y dkms
-sh scripts/build-nvfanread-deb.sh
-sudo dpkg -i dist/nvfanread_1.1.0_arm64.deb
+# nvfanread_<version>_arm64.deb from the GitHub Releases page
+sudo dpkg -i nvfanread_*_arm64.deb
 ```
 
 ### After a reboot — verify (all should just work, no manual steps)
@@ -112,15 +113,16 @@ sweep EC command / lengths / cache mode; build+sign+load via `run.sh`).
 
 ## What's done
 - **Read-only `nvfanread` module** (the *decoder*): uses `arm-ffa-17` (bound it
-  before 1.1.0), issues only
+  before the #17 build), issues only
   EC **command 7** (telemetry, read-only — never an override write), exposes a
   `telemetry` sysfs attr that dumps the 64-byte snapshot + flags u16s in the fan
   RPM ranges. Built, CI-green. Pure protocol logic in `nvfanread_proto.h`.
 - **Tests + CI + lint + release + docs** — all merged to `main` (PR #8):
   - unit tests (166 checks) on every push/PR; shellcheck lint job.
   - `scripts/lint.sh` = checkpatch (C, local) + shellcheck (shell, CI).
-  - tag-triggered release workflow builds the DKMS `.deb` with a version gate
-    (fixed a real bug: maintainer scripts were non-executable).
+  - release workflow builds the DKMS `.deb` (fixed a real bug: maintainer
+    scripts were non-executable). Since then it publishes a release on every
+    merge to `main`, with the version from PR labels (README "Releases").
   - README rewritten in English (dropped the zh/en split).
 - **MOK generated, signed, and ENROLLED** (Secure Boot solved; module loads and
   binds — dmesg "read-only telemetry ready"): key at `~/.mok/` on the DGX (`nvfanread-mok.priv` 600,

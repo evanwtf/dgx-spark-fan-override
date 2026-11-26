@@ -1,41 +1,165 @@
 name: release
 
-# A tag is the only trigger: cutting a release is `git tag -a vX.Y.Z && git
-# push --tags`. Everything below is a gate or the publish step.
+# Every merge to main publishes a GitHub Release with both .debs.
+#
+# The v* tag is the only record of the released version. main is protected
+# (PRs and required checks), so this workflow cannot push a version-bump
+# commit back, and it does not need to: the build scripts stamp the version
+# into a staging copy. The tree carries the placeholder 0.0.0.
+#
+# The PR's labels choose the bump: semver:patch (the default), semver:minor,
+# semver:major. skip-release publishes nothing. So does a merge when nothing
+# since the last v* tag changed outside docs/ and *.md files. A workflow-only
+# merge does release. A direct push to main (no PR) publishes nothing; its
+# change ships with the next PR merge.
+#
+# Do not push v* tags by hand: this workflow owns them.
+#
+# Order: plan, build, verify, notes, and only then create the tag and the
+# release. A failed build or check burns no version.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  # Rerun for the current main, for example after a failed publish. A tag
+  # already on the commit is reused, so a rerun never bumps twice.
+  workflow_dispatch:
+
+# One release at a time. cancel-in-progress: false protects only the run
+# that is already running. GitHub keeps one waiting run per group: when a
+# newer run queues, it cancels the waiting one. That merge then gets no
+# release of its own. Its code ships with the next release, under that
+# release's label and notes (plan judges every change since the last tag).
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: write
+  # Reading the PR's labels needs this. Without it the lookup is refused,
+  # and release.py fails the run rather than read it as "no labels".
+  pull-requests: read
 
 jobs:
   release:
+    if: github.ref == 'refs/heads/main'
+    # GitHub-hosted, like the other jobs here. The org's self-hosted Linux
+    # runner has no C toolchain (docs/STATUS.md), and this repo is public.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # All history and tags: plan reads the tags and diffs against them.
+          fetch-depth: 0
+          # Nothing here pushes with git; gh uses GH_TOKEN per step.
+          persist-credentials: false
 
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # setup-uv publishes no floating major tag after v7: pin a release that
+      # is past the 7-day cooldown.
+      - uses: astral-sh/setup-uv@v10.3.3
 
-      # Gate 1: the same lint + tests every push runs (checkpatch is skipped in
-      # CI; shellcheck and the unit tests run).
-      - name: Lint and unit tests
-        run: |
-          make lint
-          make test
+      - name: Install the release tooling
+        # release.py is stdlib-only: no dev tools in the release job.
+        run: uv sync --frozen --no-dev
 
-      # Gate 2 + build: each package's control Version must equal the tag
-      # (leading "v" stripped), or the build fails.
-      - name: Build packages
-        run: |
-          sh scripts/build-debs.sh "${GITHUB_REF_NAME#v}"
-          sh scripts/build-nvfanread-deb.sh "${GITHUB_REF_NAME#v}"
-
-      - name: Publish release
+      - name: Plan
+        id: plan
         env:
           GH_TOKEN: ${{ github.token }}
+        run: >-
+          uv run --frozen --no-dev python scripts/release.py plan
+          --rev "$GITHUB_SHA"
+          --repo "$GITHUB_REPOSITORY"
+          --github-output "$GITHUB_OUTPUT"
+          --step-summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Unit tests and version pin
+        if: steps.plan.outputs.release == 'true'
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/*.deb \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes
+          make test
+          sh scripts/check-versions.sh
+
+      - name: Build both packages
+        if: steps.plan.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          rm -rf dist
+          sh scripts/build-debs.sh "$VERSION" dist
+          sh scripts/build-nvfanread-deb.sh "$VERSION" dist
+          ls -l dist
+
+      - name: Verify the packages report the version
+        if: steps.plan.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: >-
+          uv run --frozen --no-dev python scripts/release.py verify
+          --version "$VERSION" dist/*.deb
+
+      # A release for this tag may exist only on a rerun that reused the tag.
+      # In any other case, stop: something else made it.
+      - name: Check for an existing release
+        id: existing
+        if: steps.plan.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          REUSED: ${{ steps.plan.outputs.reused }}
+        run: |
+          set -eu
+          if gh release view "$TAG" --json assets --jq '.assets[].name' \
+              > "$RUNNER_TEMP/assets.txt" 2> "$RUNNER_TEMP/view.err"; then
+            if [ "$REUSED" != "true" ]; then
+              echo "A release $TAG exists, but this run did not reuse a tag." >&2
+              exit 1
+            fi
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif grep -qx 'release not found' "$RUNNER_TEMP/view.err"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            cat "$RUNNER_TEMP/view.err" >&2
+            exit 1
+          fi
+
+      - name: Write the notes
+        if: steps.plan.outputs.release == 'true' && steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.plan.outputs.pr }}
+        run: |
+          set -eu
+          if [ -z "$PR" ]; then
+            echo "No pull request for $GITHUB_SHA: no notes to publish." >&2
+            exit 1
+          fi
+          uv run --frozen --no-dev python scripts/release.py notes \
+            --pr "$PR" --rev "$GITHUB_SHA" \
+            --repo "$GITHUB_REPOSITORY" --out "$RUNNER_TEMP/notes.md"
+
+      - name: Publish
+        if: steps.plan.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          EXISTS: ${{ steps.existing.outputs.exists }}
+        run: |
+          set -eu
+          if [ "$EXISTS" = "true" ]; then
+            # A rerun after a partial publish. Upload only the assets that are
+            # missing: never replace bytes that are already published.
+            for deb in dist/*.deb; do
+              if grep -qxF "$(basename "$deb")" "$RUNNER_TEMP/assets.txt"; then
+                echo "$(basename "$deb") is already on $TAG; keeping it."
+              else
+                gh release upload "$TAG" "$deb"
+              fi
+            done
+            gh release edit "$TAG" --draft=false
+          else
+            gh release create "$TAG" dist/*.deb \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+          echo "Published $TAG." >> "$GITHUB_STEP_SUMMARY"
