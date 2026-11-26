@@ -69,7 +69,7 @@ sudo scripts/setup-signing.sh ~/.mok/nvfanread-mok.priv ~/.mok/nvfanread-mok.der
 # build + install the package (needs dkms)
 sudo apt-get install -y dkms
 sh scripts/build-nvfanread-deb.sh
-sudo dpkg -i dist/nvfanread_1.0.0_arm64.deb
+sudo dpkg -i dist/nvfanread_1.1.0_arm64.deb
 ```
 
 The package registers the module with DKMS (built + signed on install and on

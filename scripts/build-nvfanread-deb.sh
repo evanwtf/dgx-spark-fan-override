@@ -10,7 +10,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 name=nvfanread
-ver=1.0.0
+ver=1.1.0
 pkgsrc="packaging/$name"
 outdir="dist"
 
