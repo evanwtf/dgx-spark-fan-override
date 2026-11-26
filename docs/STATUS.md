@@ -17,16 +17,26 @@ On `7.0.0-1025-nvidia` the built-in `nvidia-ffa-ec` driver binds `arm-ffa-17`
 1.0.0 loaded but never bound, and fan RPM went away. `7.0.0-1019` and
 `6.17.0-1032` did not list that UUID, so nvfanread bound there.
 
-nvfanread **1.1.0** does not bind. It finds the device on the FF-A bus by UUID
-and sends through it; `nvidia-ffa-ec` keeps the binding. The hwmon device keeps
-the same parent, so the `sensors` and node_exporter names do not change. The
-`telemetry` attribute moved to the hwmon device. The FF-A partition ID is
+nvfanread **1.1.0** does not need to bind. It finds the device on the FF-A bus
+by UUID and sends through it; `nvidia-ffa-ec` keeps the binding. Where the
+device is free (6.17, 7.0.0-1019) a small claim driver still binds it, so
+`nvfancontrol` and `ec-probe` cannot write the shared page at the same time.
+Each read also refuses with `-EBUSY` if one of them owns the device.
+
+The `sensors` name stays `nvfanread-virtual-0`. The node_exporter `chip` label
+changes with the kernel, because 7.0.0-1025 moved FF-A devices under
+`/sys/devices/platform/arm-ffa/`: `devices_arm_ffa_17` on 6.17 and 7.0.0-1019,
+`arm_ffa_arm_ffa_17` on 7.0.0-1025+. Query by chip name to cover both:
+`node_hwmon_fan_rpm * on(chip) group_left node_hwmon_chip_names{chip_name="nvfanread"}`.
+
+The `telemetry` attribute moved to the hwmon device. The FF-A partition ID is
 `0x8003` (shared by all EC services); `17` is only the bus index.
-`nvfancontrol` still binds as a driver and does not attach on 7.0+.
+`nvfancontrol` still binds as a driver and does not attach on 7.0.0-1025+.
 
 ## ✅ WORKING — fan RPM in `sensors` and node_exporter
 The goal is achieved end to end: **EC → hwmon → `sensors` → node_exporter →
-Prometheus.** Confirmed 2026-09-13:
+Prometheus.** Confirmed 2026-09-13 on 6.17 (on 7.0.0-1025+ the `chip` label is
+`arm_ffa_arm_ffa_17`; see above):
 ```
 nvfanread-virtual-0:  fan0: 2700 RPM   fan1: 4050 RPM
 node_hwmon_fan_rpm{chip="devices_arm_ffa_17",sensor="fan1"} 2700

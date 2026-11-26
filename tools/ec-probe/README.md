@@ -8,8 +8,10 @@ It binds `arm-ffa-17` and creates `…/arm-ffa-17/probe`; reading it issues one 
 request built from module parameters and prints the service status, elapsed time,
 and the shared-page bytes — whether the request succeeds or fails.
 
-On kernel 7.0 and later it does not bind: the built-in `nvidia-ffa-ec` driver
-owns `arm-ffa-17` (see #15), so `probe` does not appear.
+On kernel 7.0.0-1025 and later it does not bind: the built-in `nvidia-ffa-ec` driver
+owns `arm-ffa-17` (see #15), so `probe` does not appear. On older kernels it
+cannot bind while `nvfanread` 1.1.0 is loaded, because `nvfanread` claims the
+device.
 
 ## Parameters
 | param | default | meaning |

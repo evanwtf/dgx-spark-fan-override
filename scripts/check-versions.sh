@@ -24,10 +24,13 @@ postinst="$(get postinst packaging/nvfanread/DEBIAN/postinst 's/^version=//p')"
 prerm="$(get prerm packaging/nvfanread/DEBIAN/prerm 's/^version=//p')"
 build="$(get build scripts/build-nvfanread-deb.sh 's/^ver=//p')"
 module="$(get module nvfanread/nvfanread.c 's/^MODULE_VERSION("\(.*\)");$/\1/p')"
+readme_deb="$(get readme-deb nvfanread/README.md 's/.*nvfanread_\([0-9][0-9.]*\)_arm64\.deb.*/\1/p')"
+status_deb="$(get status-deb docs/STATUS.md 's/.*nvfanread_\([0-9][0-9.]*\)_arm64\.deb.*/\1/p')"
 
 status=0
 for pair in "dkms.conf:$dkms" "postinst:$postinst" "prerm:$prerm" \
-	    "build-nvfanread-deb.sh:$build" "MODULE_VERSION:$module"; do
+	    "build-nvfanread-deb.sh:$build" "MODULE_VERSION:$module" \
+	    "nvfanread/README.md .deb:$readme_deb" "docs/STATUS.md .deb:$status_deb"; do
 	name="${pair%%:*}"
 	v="${pair#*:}"
 	if [ "$v" != "$control" ]; then
