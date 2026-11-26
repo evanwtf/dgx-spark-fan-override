@@ -9,6 +9,7 @@ jobs:
     # GitHub-hosted: this repo is public, so standard-runner minutes are free
     # and unlimited. The tests are pure portable C and need no special host.
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       # The pure protocol logic is kernel- and hardware-independent, so the

@@ -1,41 +1,123 @@
 name: release
 
-# A tag is the only trigger: cutting a release is `git tag -a vX.Y.Z && git
-# push --tags`. Everything below is a gate or the publish step.
+# Every merge to main publishes a GitHub Release with both .debs.
+#
+# The v* tag is the only record of the released version. main is protected
+# (PRs and required checks), so this workflow cannot push a version-bump
+# commit back, and it does not need to: the build scripts stamp the version
+# into a staging copy. The tree carries the placeholder 0.0.0.
+#
+# The PR's labels choose the bump: semver:patch (the default), semver:minor,
+# semver:major. skip-release, or a merge that changes only docs/ and top-level
+# *.md files, publishes nothing. A workflow-only merge does release.
+#
+# Do not push v* tags by hand: this workflow owns them.
+#
+# Order: plan, build, verify, notes, and only then create the tag and the
+# release. A failed build or check burns no version.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  # Rerun for the current main, for example after a failed publish. A tag
+  # already on the commit is reused, so a rerun never bumps twice.
+  workflow_dispatch:
+
+# One release at a time. A run that waits is not cancelled by a new push;
+# GitHub keeps at most one waiting run, and a cancelled waiting run's commit
+# ships in the next release.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: write
+  # Reading the PR's labels needs this. Without it the lookup is refused,
+  # and release.py fails the run rather than read it as "no labels".
+  pull-requests: read
 
 jobs:
   release:
+    if: github.ref == 'refs/heads/main'
+    # GitHub-hosted, like the other jobs here. The org's self-hosted Linux
+    # runner has no C toolchain (docs/STATUS.md), and this repo is public.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # All history and tags: plan reads the tags and diffs the parent.
+          fetch-depth: 0
 
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # setup-uv publishes no floating major tag after v7: pin a release that
+      # is past the 7-day cooldown.
+      - uses: astral-sh/setup-uv@v10.3.3
 
-      # Gate 1: the same lint + tests every push runs (checkpatch is skipped in
-      # CI; shellcheck and the unit tests run).
-      - name: Lint and unit tests
-        run: |
-          make lint
-          make test
+      - name: Install the release tooling
+        run: uv sync --frozen
 
-      # Gate 2 + build: each package's control Version must equal the tag
-      # (leading "v" stripped), or the build fails.
-      - name: Build packages
-        run: |
-          sh scripts/build-debs.sh "${GITHUB_REF_NAME#v}"
-          sh scripts/build-nvfanread-deb.sh "${GITHUB_REF_NAME#v}"
-
-      - name: Publish release
+      - name: Plan
+        id: plan
         env:
           GH_TOKEN: ${{ github.token }}
+        run: >-
+          uv run --frozen python scripts/release.py plan
+          --rev "$GITHUB_SHA"
+          --repo "$GITHUB_REPOSITORY"
+          --github-output "$GITHUB_OUTPUT"
+          --step-summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Unit tests and version pin
+        if: steps.plan.outputs.release == 'true'
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/*.deb \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes
+          make test
+          sh scripts/check-versions.sh
+
+      - name: Build both packages
+        if: steps.plan.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          rm -rf dist
+          sh scripts/build-debs.sh "$VERSION" dist
+          sh scripts/build-nvfanread-deb.sh "$VERSION" dist
+          ls -l dist
+
+      - name: Verify the packages report the version
+        if: steps.plan.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: uv run --frozen python scripts/release.py verify --version "$VERSION" dist/*.deb
+
+      - name: Write the notes
+        if: steps.plan.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.plan.outputs.pr }}
+        run: |
+          if [ -n "$PR" ]; then
+            set -- --pr "$PR"
+          else
+            set -- --rev "$GITHUB_SHA"
+          fi
+          uv run --frozen python scripts/release.py notes "$@" \
+            --repo "$GITHUB_REPOSITORY" --out "$RUNNER_TEMP/notes.md"
+
+      - name: Publish
+        if: steps.plan.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -eu
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A rerun after a partial publish: replace the assets and make
+            # sure the release is not left as a draft.
+            gh release upload "$TAG" dist/*.deb --clobber
+            gh release edit "$TAG" --draft=false
+          else
+            gh release create "$TAG" dist/*.deb \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+          echo "Published $TAG." >> "$GITHUB_STEP_SUMMARY"

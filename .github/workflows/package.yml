@@ -11,9 +11,12 @@ on:
 jobs:
   deb:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
+      # No version argument: the build stamps the in-tree placeholder 0.0.0.
+      # These are test builds; release .debs come from release.yml.
       - name: Build .deb packages
         run: |
           sh scripts/build-debs.sh              # nvfancontrol (static tree)
@@ -24,9 +27,19 @@ jobs:
             dpkg-deb -I "$d" | sed -n '1,12p'
           done
 
+      # setup-uv publishes no floating major tag after v7: pin a release that
+      # is past the 7-day cooldown.
+      - uses: astral-sh/setup-uv@v10.3.3
+
+      - name: Verify the packages report the placeholder version
+        run: |
+          uv sync --frozen
+          uv run --frozen python scripts/release.py verify --version 0.0.0 dist/*.deb
+
       - name: Upload .deb artifacts
         uses: actions/upload-artifact@v4
         with:
           name: debs
           path: dist/*.deb
           if-no-files-found: error
+          retention-days: 3

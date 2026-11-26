@@ -1,0 +1,41 @@
+name: python
+
+# Checks for the release tooling (scripts/release.py and tests/). The job is
+# named release-tooling so it does not collide with the required checks
+# `lint` and `unit-tests`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  release-tooling:
+    # GitHub-hosted, like the other jobs here: this repo is public, and the
+    # tests build .debs with dpkg-deb, which ubuntu-latest has.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # setup-uv publishes no floating major tag after v7: pin a release that
+      # is past the 7-day cooldown.
+      - uses: astral-sh/setup-uv@v10.3.3
+      - run: uv sync --frozen
+      # One run reports every problem: collect the status of both ruff steps.
+      - name: ruff
+        run: |
+          status=0
+          uv run --frozen ruff format --check . || status=$?
+          uv run --frozen ruff check . || status=$?
+          exit "$status"
+      - name: mypy
+        run: uv run --frozen mypy
+      # Every test's dependency (git, dpkg-deb) is on the runner, so any skip
+      # is a failure.
+      - name: pytest (fail on skip)
+        run: |
+          set -o pipefail
+          uv run --frozen pytest -q -rs | tee "$RUNNER_TEMP/pytest.txt"
+          if grep -q SKIPPED "$RUNNER_TEMP/pytest.txt"; then
+            echo "unexpected skipped test" >&2
+            exit 1
+          fi
