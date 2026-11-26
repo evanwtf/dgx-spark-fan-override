@@ -16,9 +16,13 @@ modules can stay loaded together and take turns. See
 [`nvfanread/README.md`](nvfanread/README.md#one-mailbox-user-at-a-time) for how
 this works on each kernel.
 
-> **Install `nvfanread` and `nvfancontrol` from the same release.** Modules
-> from 1.0.0 do not take the mailbox lock. A 1.0.0 module next to a newer one
-> can write the shared page at the same time as the other.
+> **Install `nvfanread` and `nvfancontrol` from the same release.** Older
+> builds do not take the mailbox lock: `nvfancontrol` 1.0.0, `nvfanread`
+> 1.0.0, and the `nvfanread` build from
+> [#17](https://github.com/evanwtf/dgx-spark-fan-override/pull/17). A build
+> without the lock can write the shared page at the same time as the other
+> module. `nvfancontrol` refuses to send (`error -11`) while it sees an
+> `nvfanread` without the lock.
 
 `nvfanread` is the read-only tool — see
 [`nvfanread/README.md`](nvfanread/README.md). Everything below documents the
@@ -27,11 +31,11 @@ shared EC/FF-A protocol.
 > **Kernel 7.0.0-1025 and later.** The built-in `nvidia-ffa-ec` driver now
 > binds `arm-ffa-17` itself, and no other driver can take it over (see
 > [#15](https://github.com/evanwtf/dgx-spark-fan-override/issues/15)).
-> `nvfanread` 1.1.0 and the current `nvfancontrol` work with this: they use
-> the device without binding it (see
-> [#16](https://github.com/evanwtf/dgx-spark-fan-override/issues/16)).
-> `nvfancontrol` 1.0.0 binds as a driver, so on these kernels it loads but
-> does not attach, and cannot use the mailbox.
+> `nvfanread` and `nvfancontrol` work with this: they use the device without
+> binding it (see
+> [#16](https://github.com/evanwtf/dgx-spark-fan-override/issues/16)). The
+> `nvfancontrol` build that binds as a driver (1.0.0) loads on these kernels
+> but does not attach, and cannot use the mailbox.
 
 ### Motivation: fan RPM in Prometheus
 
@@ -83,16 +87,21 @@ node_hwmon_fan_rpm * on(chip) group_left node_hwmon_chip_names{chip_name="nvfanr
 - If you only want to *read* fan speed, use `nvfanread` and leave `nvfancontrol`
   uninstalled — the read path never writes an override slot.
 - **The `fan` attribute moved.** It is now
-  `/sys/devices/faux/nvfancontrol/fan` on every kernel. `nvfancontrol` 1.0.0
-  put it on the FF-A device (`/sys/bus/arm_ffa/devices/arm-ffa-17/fan`).
-  Update any script that writes the old path.
+  `/sys/devices/faux/nvfancontrol/fan` on every kernel. The build that bound
+  the FF-A device put it at `/sys/bus/arm_ffa/devices/arm-ffa-17/fan`. Update
+  any script that writes the old path.
 - **Use matching versions.** Install `nvfanread` and `nvfancontrol` from the
-  same release. A 1.0.0 module does not take the mailbox lock, so it can write
-  the shared page while the other module uses it.
-- **A busy mailbox fails the write.** If `nvfanread` holds the mailbox lock for
-  more than 50 ms, a write to `fan` returns `EBUSY` and sends nothing to the
-  EC. The attribute then reads `error -16`. The EC keeps its previous override
-  value, so you can write again.
+  same release. A build without the mailbox lock can write the shared page
+  while the other module uses it.
+- **`error -11` means nothing was sent.** The EC keeps its previous setting,
+  and a retry is safe. `sudo nvfancontrol` retries it 3 times, 1 s apart, then
+  exits with status 75. Any other error means the request may have reached
+  the EC, and its override state is unknown.
+- **A timeout poisons the mailbox.** If the EC does not answer within 5 s, the
+  module keeps the mailbox lock, leaves the shared page as it is, and refuses
+  every later request with `error -131`. Unload that module to clear it. The
+  EC may then need the cold power drain from
+  [#10](https://github.com/evanwtf/dgx-spark-fan-override/issues/10).
 
 ## `nvfancontrol` — override
 
@@ -110,19 +119,43 @@ module when needed.
 
 Each request:
 
-1. Refuses if a driver that writes the shared page without the lock owns
-   `arm-ffa-17` (`nvfancontrol` 1.0.0 or the `ec-probe` tool). `nvidia-ffa-ec`
-   and `nvfanread` are allowed.
-2. Takes the `nvfan-mailbox` lock: `request_mem_region()` on the shared page
-   `0x933dd000`, size `0x1000`. If `nvfanread` holds it, the module tries again
-   for up to 50 ms, then returns `-EBUSY` and sends nothing.
-3. Snapshots the page, writes the frame, rings the doorbell (and retries a busy
-   doorbell for up to 10 ms), waits for the EC reply and restores the page.
-4. Releases the lock.
+1. Refuses if a driver that binds `arm-ffa-17` and writes the shared page
+   without the lock owns the device (the `nvfancontrol` build that binds, or
+   the `ec-probe` tool). `nvidia-ffa-ec` and `nvfanread` are allowed.
+2. Refuses if an `nvfanread` without the mailbox lock is loaded. Every
+   `nvfanread` puts a hwmon device named `nvfanread` under `arm-ffa-17`; a
+   build with the lock also exports the symbol `nvfanread_mailbox_lock_v1`.
+3. Takes the `nvfan-mailbox` lock: `request_mem_region()` on the shared page
+   `0x933dd000`, size `0x1000`. If another module holds it, it waits up to
+   8 s. That is longer than the longest `nvfanread` request (5 s reply timeout
+   plus 10 ms of doorbell retries). It then gives up with `-EAGAIN` and sends
+   nothing.
+4. Snapshots the page, writes the frame, rings the doorbell (and retries a busy
+   doorbell for up to 10 ms), waits up to 5 s for the EC reply and restores the
+   page.
+5. Releases the lock.
+
+`nvfanread` takes the same lock for each read, but waits only 50 ms for it.
 
 The lock is held for one request only, so `nvfanread` and `nvfancontrol` can
 stay loaded together on every kernel. While a request runs, `/proc/iomem`
-shows `933dd000-933ddfff : nvfan-mailbox` under the `reserved` region.
+shows `933dd000-933ddfff : nvfan-mailbox` under the `reserved` region. Each
+module refuses to load if the shared page overlaps System RAM.
+
+Error codes from a write to `fan` (the attribute then reads `error <errno>`):
+
+| Errno | Meaning | Safe to retry? |
+|---|---|---|
+| `-11` (`EAGAIN`) | Nothing was sent: the lock was busy, an owner or `nvfanread` check refused, the mailbox was not idle, the FF-A partition stayed busy, or the page could not be mapped. | Yes |
+| `-22` (`EINVAL`) | The input was not `max` or `auto`. Nothing was sent. | Fix the input |
+| `-4` (`EINTR`) | A signal arrived while waiting for another write. Nothing was sent. | Yes |
+| `-131` (`ENOTRECOVERABLE`) | An earlier request timed out. The mailbox is poisoned until the module is unloaded. | No |
+| `-110` (`ETIMEDOUT`) | The EC did not answer within 5 s. The mailbox is now poisoned. | No |
+| `-16` (`EBUSY`) | The EC answered "busy" (service status 10). | State unknown |
+| `-5`, `-71`, `-117`, others | Transport failure, service error, reply mismatch, or failed page restore. | State unknown |
+
+`nvfanread` uses the same codes for its reads: `-EAGAIN` means nothing was
+sent.
 
 ```text
 Full fan speed:   07 05 00 BC 34    # 0x34BC = 13500 RPM

@@ -17,11 +17,13 @@ On `7.0.0-1025-nvidia` the built-in `nvidia-ffa-ec` driver binds `arm-ffa-17`
 1.0.0 loaded but never bound, and fan RPM went away. `7.0.0-1019` and
 `6.17.0-1032` did not list that UUID, so nvfanread bound there.
 
-nvfanread **1.1.0** does not need to bind. It finds the device on the FF-A bus
-by UUID and sends through it; `nvidia-ffa-ec` keeps the binding. Where the
-device is free (6.17, 7.0.0-1019) a small claim driver still binds it, so
-`nvfancontrol` and `ec-probe` cannot write the shared page at the same time.
-Each read also refuses with `-EBUSY` if one of them owns the device.
+nvfanread no longer needs to bind. It finds the device on the FF-A bus by UUID
+and sends through it; `nvidia-ffa-ec` keeps the binding. Where the device is
+free (6.17, 7.0.0-1019) a small claim driver still binds it, so drivers that
+bind and write the page without the mailbox lock (the `nvfancontrol` build that binds,
+`ec-probe`) cannot attach. Each read also refuses with `-EAGAIN` if one of
+them owns the device. Against other locking modules, the mailbox lock below
+does the work.
 
 The `sensors` name stays `nvfanread-virtual-0`. The node_exporter `chip` label
 changes with the kernel, because 7.0.0-1025 moved FF-A devices under
@@ -38,7 +40,11 @@ neither module binds on 7.0.0-1025+, both now take a mailbox lock for each
 request: `request_mem_region(0x933dd000, 0x1000, "nvfan-mailbox")`. The page
 sits in a top-level non-busy `reserved` iomem region, so the request nests
 under it, and a second request fails until the first is released. Install both
-modules from the same release; 1.0.0 modules do not take the lock.
+modules from the same release: builds without the lock (`nvfanread` 1.0.0 and
+the #17 build; the `nvfancontrol` build that binds) can write the page at the same time.
+`nvfancontrol` refuses to send while an `nvfanread` without the lock is loaded.
+`-EAGAIN` means nothing was sent; an output timeout poisons the mailbox until
+the module is unloaded. Live test: `scripts/live-test-nvfancontrol.sh`.
 
 ## ✅ WORKING — fan RPM in `sensors` and node_exporter
 The goal is achieved end to end: **EC → hwmon → `sensors` → node_exporter →
