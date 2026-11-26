@@ -1,7 +1,8 @@
 #!/bin/sh
 # Tests for scripts/check-mailbox-lock.sh. It must pass on the real tree and
-# fail when either module locks a different page, uses a different lock name
-# or bound, or stops taking the lock.
+# fail when either module locks a different page or uses a different lock
+# name, when nvfancontrol's lock wait no longer outlasts nvfanread's longest
+# hold, or when a module stops taking the lock.
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -12,7 +13,8 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 files="nvfanread/nvfanread.c nvfanread/nvfanread_proto.h \
-	nvfancontrol/usr/src/nvfancontrol/nvfancontrol.c"
+	nvfancontrol/usr/src/nvfancontrol/nvfancontrol.c \
+	tools/mailbox-hold/nvfanhold.c"
 
 fresh_copy() {
 	dir="$(mktemp -d -p "$tmp")"
@@ -52,6 +54,11 @@ proto=nvfanread/nvfanread_proto.h
 
 expect pass "real tree is consistent" "$repo"
 
+# The inequality holds at its exact edge (5 s + 10 ms + 2 s = 7010000 us).
+dir="$(fresh_copy)"
+sed -i 's/^#define LOCK_RETRY_BUDGET_US .*/#define LOCK_RETRY_BUDGET_US 7010000LL/' "$dir/$ctl"
+expect pass "lock budget at the exact minimum" "$dir"
+
 mutate "address mismatch in nvfancontrol" "$ctl" \
 	's/^#define ESPI_NS_SHM_PA .*/#define ESPI_NS_SHM_PA 0x933de000ULL/'
 mutate "address mismatch in nvfanread" "$rd" \
@@ -60,10 +67,19 @@ mutate "size mismatch" "$ctl" \
 	's/^#define ESPI_NS_SHM_SIZE .*/#define ESPI_NS_SHM_SIZE 0x2000U/'
 mutate "lock name mismatch" "$ctl" \
 	's/^#define MAILBOX_LOCK_NAME .*/#define MAILBOX_LOCK_NAME "nvfancontrol"/'
-mutate "retry budget mismatch" "$proto" \
-	's/^#define NVFR_LOCK_RETRY_BUDGET_US .*/#define NVFR_LOCK_RETRY_BUDGET_US 1LL/'
-mutate "attempt cap mismatch" "$ctl" \
-	's/^#define LOCK_MAX_ATTEMPTS .*/#define LOCK_MAX_ATTEMPTS 5U/'
+mutate "test-tool address mismatch" tools/mailbox-hold/nvfanhold.c \
+	's/^#define ESPI_NS_SHM_PA .*/#define ESPI_NS_SHM_PA 0x933de000ULL/'
+
+# The wait inequality: 8 s >= 5 s + 10 ms + 2 s. Each side can break it.
+mutate "nvfancontrol lock budget too short" "$ctl" \
+	's/^#define LOCK_RETRY_BUDGET_US .*/#define LOCK_RETRY_BUDGET_US 7000000LL/'
+mutate "nvfanread reply timeout too long" "$rd" \
+	's/^#define REPLY_TIMEOUT_MS .*/#define REPLY_TIMEOUT_MS 6000U/'
+mutate "nvfanread doorbell budget too long" "$proto" \
+	's/^#define NVFR_SEND_RETRY_BUDGET_US .*/#define NVFR_SEND_RETRY_BUDGET_US 1000001LL/'
+mutate "unreadable lock budget" "$ctl" \
+	's/^#define LOCK_RETRY_BUDGET_US .*/#define LOCK_RETRY_BUDGET_US (8 * USEC_PER_SEC)/'
+
 mutate "missing lock name define" "$proto" \
 	'/^#define NVFR_MAILBOX_LOCK_NAME/d'
 mutate "nvfancontrol stops taking the lock" "$ctl" \

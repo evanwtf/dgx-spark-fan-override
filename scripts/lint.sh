@@ -30,7 +30,7 @@ fi
 # (*.mod.c). Built with a glob + case rather than `ls | grep` (shellcheck SC2010).
 c_files=""
 for f in nvfanread/*.c nvfanread/*.h nvfanread/tests/*.c \
-	 nvfancontrol/usr/src/nvfancontrol/*.c; do
+	 nvfancontrol/usr/src/nvfancontrol/*.c tools/mailbox-hold/*.c; do
 	[ -e "$f" ] || continue
 	case "$f" in
 	*.mod.c) continue ;;
@@ -78,7 +78,8 @@ fi
 echo "== mailbox lock pin =="
 if command -v shellcheck >/dev/null 2>&1; then
 	shellcheck scripts/check-mailbox-lock.sh \
-		scripts/test-check-mailbox-lock.sh || status=1
+		scripts/test-check-mailbox-lock.sh \
+		scripts/live-test-nvfancontrol.sh || status=1
 fi
 sh scripts/check-mailbox-lock.sh || status=1
 sh scripts/test-check-mailbox-lock.sh || status=1

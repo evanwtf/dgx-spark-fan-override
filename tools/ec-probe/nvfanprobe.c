@@ -7,11 +7,16 @@
  *
  * Read-only intent: default command is 7 (telemetry). It CAN be pointed at a
  * write command via params, so don't do that unless you mean to.
+ *
+ * It takes the same "nvfan-mailbox" lock as nvfanread and nvfancontrol (a busy
+ * iomem region on the shared page) around each request, and gives up at once
+ * if another module holds it.
  */
 #include <linux/arm_ffa.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/io.h>
+#include <linux/ioport.h>
 #include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -74,6 +79,11 @@ static ssize_t probe_show(struct device *dev, struct device_attribute *a, char *
 		mutex_unlock(&s->lock);
 		return sysfs_emit(buf, "memremap failed\n");
 	}
+	if (!request_mem_region(SHM_PA, SHM_SIZE, "nvfan-mailbox")) {
+		memunmap(shm);
+		mutex_unlock(&s->lock);
+		return sysfs_emit(buf, "mailbox lock busy (nvfanread or nvfancontrol); nothing sent\n");
+	}
 	memcpy(snap, shm, SNAP);
 
 	len += scnprintf(buf + len, PAGE_SIZE - len,
@@ -125,6 +135,7 @@ static ssize_t probe_show(struct device *dev, struct device_attribute *a, char *
 
 	memcpy(shm, snap, SNAP);
 	mb();
+	release_mem_region(SHM_PA, SHM_SIZE);
 	memunmap(shm);
 	mutex_unlock(&s->lock);
 	return len;
