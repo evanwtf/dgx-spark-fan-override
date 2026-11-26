@@ -10,9 +10,33 @@ via a **read-only** hwmon driver that reads the EC's fan telemetry over FF-A.
 The box's tachometers are EC-owned; nothing in the OS exposes fan RPM today
 (`sensors` shows temps only). Tracking issue: **#7**.
 
+## Kernel 7.0 (2026-11-25, #15)
+On `7.0.0-1025-nvidia` the built-in `nvidia-ffa-ec` driver binds `arm-ffa-17`
+(Ubuntu commit `9c0c984e122c` added UUID `884a63a0-…`). It sets
+`suppress_bind_attrs`, and the FF-A bus has no `driver_override`, so nvfanread
+1.0.0 loaded but never bound, and fan RPM went away. `7.0.0-1019` and
+`6.17.0-1032` did not list that UUID, so nvfanread bound there.
+
+nvfanread **1.1.0** does not need to bind. It finds the device on the FF-A bus
+by UUID and sends through it; `nvidia-ffa-ec` keeps the binding. Where the
+device is free (6.17, 7.0.0-1019) a small claim driver still binds it, so
+`nvfancontrol` and `ec-probe` cannot write the shared page at the same time.
+Each read also refuses with `-EBUSY` if one of them owns the device.
+
+The `sensors` name stays `nvfanread-virtual-0`. The node_exporter `chip` label
+changes with the kernel, because 7.0.0-1025 moved FF-A devices under
+`/sys/devices/platform/arm-ffa/`: `devices_arm_ffa_17` on 6.17 and 7.0.0-1019,
+`arm_ffa_arm_ffa_17` on 7.0.0-1025+. Query by chip name to cover both:
+`node_hwmon_fan_rpm * on(chip) group_left node_hwmon_chip_names{chip_name="nvfanread"}`.
+
+The `telemetry` attribute moved to the hwmon device. The FF-A partition ID is
+`0x8003` (shared by all EC services); `17` is only the bus index.
+`nvfancontrol` still binds as a driver and does not attach on 7.0.0-1025+.
+
 ## ✅ WORKING — fan RPM in `sensors` and node_exporter
 The goal is achieved end to end: **EC → hwmon → `sensors` → node_exporter →
-Prometheus.** Confirmed 2026-09-13:
+Prometheus.** Confirmed 2026-09-13 on 6.17 (on 7.0.0-1025+ the `chip` label is
+`arm_ffa_arm_ffa_17`; see above):
 ```
 nvfanread-virtual-0:  fan0: 2700 RPM   fan1: 4050 RPM
 node_hwmon_fan_rpm{chip="devices_arm_ffa_17",sensor="fan1"} 2700
@@ -45,7 +69,7 @@ Install (one-time signing setup, then the package):
 sudo scripts/setup-signing.sh ~/.mok/nvfanread-mok.priv ~/.mok/nvfanread-mok.der
 sudo apt-get install -y dkms
 sh scripts/build-nvfanread-deb.sh
-sudo dpkg -i dist/nvfanread_1.0.0_arm64.deb
+sudo dpkg -i dist/nvfanread_1.1.0_arm64.deb
 ```
 
 ### After a reboot — verify (all should just work, no manual steps)
@@ -74,7 +98,8 @@ Diagnostic harness used to reach this: **`tools/ec-probe/`** (parametrized probe
 sweep EC command / lengths / cache mode; build+sign+load via `run.sh`).
 
 ## What's done
-- **Read-only `nvfanread` module** (the *decoder*): binds `arm-ffa-17`, issues only
+- **Read-only `nvfanread` module** (the *decoder*): uses `arm-ffa-17` (bound it
+  before 1.1.0), issues only
   EC **command 7** (telemetry, read-only — never an override write), exposes a
   `telemetry` sysfs attr that dumps the 64-byte snapshot + flags u16s in the fan
   RPM ranges. Built, CI-green. Pure protocol logic in `nvfanread_proto.h`.

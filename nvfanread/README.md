@@ -2,8 +2,8 @@
 
 A small kernel module that **reads** DGX Spark fan telemetry from the EC and
 never changes fan behavior. It is a clean-room, read-only companion to the
-override driver in this repo: it binds the same FF-A partition (`arm-ffa-17`)
-but issues **only EC inner command 7** — the documented thermal/fan telemetry
+override driver in this repo: it talks to the same FF-A eSPI service
+(`arm-ffa-17`) but issues **only EC inner command 7** — the documented thermal/fan telemetry
 snapshot — and never touches an override slot (EC commands 3/5).
 
 It surfaces real fan RPM through a **hwmon** device (`fan1_input` / `fan2_input`),
@@ -24,6 +24,52 @@ the mailbox handshake here is derived from that project's `nvfancontrol.c`
 fork, which validated them by reading real RPM on hardware. This module is
 GPL-2.0. See the top-level `README` for full credits.
 
+## Coexistence with `nvidia-ffa-ec` (kernel 7.0.0-1025 and later)
+
+On 7.0.0-1025 and later nvidia kernels the built-in `nvidia-ffa-ec` driver binds `arm-ffa-17`
+(Ubuntu commit `9c0c984e122c` added its UUID). That driver sets
+`suppress_bind_attrs`, so it has no `unbind` file, and the FF-A bus has no
+`driver_override`. No other driver can bind the device. See
+[#15](https://github.com/evanwtf/dgx-spark-fan-override/issues/15).
+
+So `nvfanread` does not need to bind it. At load it finds the device on the
+FF-A bus by UUID, holds a reference, and sends its requests through that device.
+It does not change the device or its driver. `nvidia-ffa-ec` only forwards ACPI
+requests to this service (this box's ACPI tables send none) and never uses the
+shared page, so the two do not compete for the mailbox.
+
+The journal shows which driver owns the device:
+
+```text
+nvfanread: arm-ffa-17 (partition 0x8003) is bound to driver 'nvidia-ffa-ec'
+```
+
+## One mailbox user at a time
+
+The shared page has no lock. Binding `arm-ffa-17` is the only thing that stops
+`nvfanread`, `nvfancontrol` and the `ec-probe` tool from writing it at the same
+time.
+
+- **6.17.0-1032 and 7.0.0-1019:** nothing else binds the device, so `nvfanread`
+  binds it with a small claim driver, as 1.0.0 did. While it is loaded,
+  `nvfancontrol` and `ec-probe` cannot bind. If one of them bound first,
+  `nvfanread` still loads, but each read returns `-EBUSY` and logs a warning.
+- **7.0.0-1025 and later:** `nvidia-ffa-ec` holds the device, so neither
+  `nvfancontrol` nor `ec-probe` can bind, and `nvfanread` is the only mailbox
+  user.
+
+Before each read `nvfanread` checks who owns the device. It sends only when the
+device is unbound, or bound to `nvidia-ffa-ec` or to `nvfanread`.
+
+The secure partition also serves other EC services. It answers "busy" when
+another request is in flight, so `nvfanread` retries a busy send for up to
+10 ms (20 tries), as `nvidia-ffa-ec` does. Each result, good or bad, is cached
+for 200 ms, so a tight reader loop cannot flood the partition.
+
+If the FF-A device is missing, 1.1.0 fails to load with `-ENODEV` (1.0.0 loaded
+and stayed unbound), so `systemd-modules-load` reports a failure on such a
+system.
+
 ## Safety
 
 - **Read-only by construction.** The request builder can emit only command 7;
@@ -37,7 +83,7 @@ GPL-2.0. See the top-level `README` for full credits.
 
 | File | Purpose |
 |---|---|
-| `nvfanread.c` | Kernel module: FF-A / shared-page I/O and the `telemetry` sysfs attribute |
+| `nvfanread.c` | Kernel module: FF-A / shared-page I/O, hwmon device, and the `telemetry` attribute |
 | `nvfanread_proto.h` | Pure protocol logic (frame build, validation, RPM classification), shared with the tests |
 | `tests/test_proto.c` | Userspace unit tests for the pure logic |
 | `Makefile` | `all`, `test`, `lint`, `check`, `clean` |
@@ -69,7 +115,7 @@ sudo scripts/setup-signing.sh ~/.mok/nvfanread-mok.priv ~/.mok/nvfanread-mok.der
 # build + install the package (needs dkms)
 sudo apt-get install -y dkms
 sh scripts/build-nvfanread-deb.sh
-sudo dpkg -i dist/nvfanread_1.0.0_arm64.deb
+sudo dpkg -i dist/nvfanread_1.1.0_arm64.deb
 ```
 
 The package registers the module with DKMS (built + signed on install and on
@@ -85,11 +131,12 @@ sudo insmod nvfanread.ko
 sensors                                             # fan RPM via hwmon
 cat /sys/class/hwmon/hwmon*/fan1_input              # fan0 RPM (direct)
 cat /sys/class/hwmon/hwmon*/fan2_input              # fan1 RPM (direct)
-cat /sys/bus/arm_ffa/devices/arm-ffa-17/telemetry   # raw snapshot + decoded RPM (debug)
+cat /sys/class/hwmon/hwmon*/telemetry               # raw snapshot + decoded RPM (debug)
 sudo rmmod nvfanread
 ```
 
 The module registers a hwmon device named `nvfanread` exposing `fan1_input`
-(fan0) and `fan2_input` (fan1) in RPM. The `telemetry` debug attribute dumps the
+(fan0) and `fan2_input` (fan1) in RPM. The `telemetry` debug attribute, on the
+same hwmon device, dumps the
 64-byte snapshot as hex, the decoded RPM, and any little-endian u16 in the fan
 RPM ranges (fan0 1260–9000, fan1 1890–13500) as candidates.

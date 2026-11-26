@@ -164,7 +164,7 @@ signing key is untouched.
 
 ```sh
 sudo insmod ~/git/dgx-spark-fan-override/nvfanread/nvfanread.ko
-cat /sys/bus/arm_ffa/devices/arm-ffa-17/telemetry   # the payoff: the fan snapshot
+cat /sys/class/hwmon/hwmon*/telemetry                # the payoff: the fan snapshot
 sudo dmesg | grep -i nvfanread | tail
 sudo rmmod nvfanread                                 # when done
 ```

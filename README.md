@@ -9,10 +9,22 @@ provides two independent kernel modules:
 | [`nvfancontrol`](nvfancontrol/) | **write** | Override the fans: force 100% or restore the EC's automatic thermal policy. |
 | [`nvfanread`](nvfanread/) | **read-only** | Read fan telemetry from the EC without changing anything; intended to surface fan RPM through hwmon / `sensors` / node_exporter. |
 
-Both bind the same verified FF-A partition (`arm-ffa-17`) but only one can be
-bound at a time. `nvfanread` is the read-only tool — see
+Both talk to the same verified FF-A eSPI service (`arm-ffa-17`) through one
+shared page, which has no lock. Only one of them can use the mailbox at a time:
+whichever module binds `arm-ffa-17` first holds it, and the other cannot use
+the mailbox until it is unloaded. See
+[`nvfanread/README.md`](nvfanread/README.md#one-mailbox-user-at-a-time) for how
+this works on each kernel.
+`nvfanread` is the read-only tool — see
 [`nvfanread/README.md`](nvfanread/README.md). Everything below documents the
 shared EC/FF-A protocol.
+
+> **Kernel 7.0.0-1025 and later.** The built-in `nvidia-ffa-ec` driver now
+> binds `arm-ffa-17` itself, and no other driver can take it over (see
+> [#15](https://github.com/evanwtf/dgx-spark-fan-override/issues/15)).
+> `nvfanread` 1.1.0 works with this: it uses the device without binding it.
+> `nvfancontrol` still binds as a driver, so on these kernels it loads but does
+> not attach, and cannot use the mailbox.
 
 ### Motivation: fan RPM in Prometheus
 
@@ -28,7 +40,23 @@ node_hwmon_fan_rpm{chip="devices_arm_ffa_17",sensor="fan1"} 2700
 node_hwmon_fan_rpm{chip="devices_arm_ffa_17",sensor="fan2"} 4050
 ```
 
-That works today. `sensors` shows the same via `nvfanread-virtual-0`.
+The `chip` label comes from the FF-A device's sysfs path, so it depends on the
+kernel:
+
+| Kernel | FF-A device path | `chip` label |
+|---|---|---|
+| 6.17.0-1032, 7.0.0-1019 | `/sys/devices/arm-ffa-17` | `devices_arm_ffa_17` |
+| 7.0.0-1025 and later | `/sys/devices/platform/arm-ffa/arm-ffa-17` | `arm_ffa_arm_ffa_17` |
+
+To check it, run `readlink -f /sys/class/hwmon/hwmonN/device` for the
+`nvfanread` hwmon device. For a query that works on every kernel, select by the
+chip name instead of the label:
+
+```promql
+node_hwmon_fan_rpm * on(chip) group_left node_hwmon_chip_names{chip_name="nvfanread"}
+```
+
+`sensors` shows the same RPM as `nvfanread-virtual-0` on every kernel.
 
 > **Unofficial and firmware-specific.** This is reverse-engineered, not an NVIDIA
 > interface. The addresses and command numbers below were observed on EC firmware
@@ -81,15 +109,21 @@ Linux kernel module
   -> PWM0/TACH0 and PWM1/TACH1
 ```
 
-FF-A raw-eSPI partition:
+FF-A raw-eSPI service:
 
 ```text
 device:       /sys/bus/arm_ffa/devices/arm-ffa-17
 UUID:         884a63a0-3285-4120-83aa-eec008a0a546
-partition ID: 0x11
+partition ID: 0x8003
 properties:   0x109
 shared page:  0x933DD000, size 0x1000
 ```
+
+The partition ID is the FF-A endpoint ID (`partition_id` in sysfs). On kernel
+7.0.0-1025 it reads `0x8003`, and the other EC services (thermal, fan, power and
+more) share it: one secure partition serves many UUIDs. The `17` in `arm-ffa-17`
+(`0x11`) is only the bus device index. Earlier versions of this README gave
+`0x11` as the partition ID, which mixed up the two.
 
 ## EC fan-control firmware reference
 

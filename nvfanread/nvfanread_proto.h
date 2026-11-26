@@ -18,11 +18,13 @@
  * for a header shared across both worlds (the lint target ignores NEW_TYPEDEFS).
  */
 #ifdef __KERNEL__
+#include <linux/errno.h>
 #include <linux/types.h>
 typedef u8  nvfr_u8;
 typedef u16 nvfr_u16;
 typedef size_t nvfr_size;
 #else
+#include <errno.h>
 #include <stdint.h>
 #include <stddef.h>
 typedef uint8_t  nvfr_u8;
@@ -159,6 +161,92 @@ static inline void nvfr_snapshot_fan_rpm(const nvfr_u8 *snapshot,
 {
 	*fan0_rpm = nvfr_le16(&snapshot[NVFR_SNAPSHOT_FAN0_RPM_OFFSET]);
 	*fan1_rpm = nvfr_le16(&snapshot[NVFR_SNAPSHOT_FAN1_RPM_OFFSET]);
+}
+
+/*
+ * FF-A service UUID of the EC eSPI service: 884a63a0-3285-4120-83aa-eec008a0a546,
+ * as the 16 bytes of a kernel uuid_t (big-endian order, not the ACPI
+ * mixed-endian order). On DGX Spark this is bus device arm-ffa-17, which is
+ * one service of secure partition 0x8003.
+ */
+#define NVFR_UUID_LEN               16U
+
+static inline int nvfr_uuid_is_espi(const nvfr_u8 *uuid)
+{
+	static const nvfr_u8 espi[NVFR_UUID_LEN] = {
+		0x88, 0x4a, 0x63, 0xa0, 0x32, 0x85, 0x41, 0x20,
+		0x83, 0xaa, 0xee, 0xc0, 0x08, 0xa0, 0xa5, 0x46,
+	};
+	nvfr_size i;
+
+	for (i = 0; i < NVFR_UUID_LEN; i++)
+		if (uuid[i] != espi[i])
+			return 0;
+	return 1;
+}
+
+/*
+ * Retry bounds for the FF-A doorbell send. The EC secure partition serves many
+ * services and answers FFA_RET_BUSY (-EBUSY) while another request is in
+ * flight. nvidia-ffa-ec retries its own sends for 10 ms; use the same budget,
+ * plus an attempt cap so a clock problem cannot make the loop unbounded.
+ */
+#define NVFR_SEND_RETRY_BUDGET_US   10000LL
+#define NVFR_SEND_MAX_ATTEMPTS      20U
+
+/*
+ * Return 1 if the caller should send again. @ret is the last send result,
+ * @attempts the number of sends made so far (1 after the first), @elapsed_us
+ * the time since the first send. Only -EBUSY retries.
+ */
+static inline int nvfr_send_should_retry(int ret, unsigned int attempts,
+					 long long elapsed_us)
+{
+	return ret == -EBUSY &&
+	       attempts < NVFR_SEND_MAX_ATTEMPTS &&
+	       elapsed_us < NVFR_SEND_RETRY_BUDGET_US;
+}
+
+/*
+ * Driver names allowed to own the FF-A device while nvfanread uses the shared
+ * page. The page has no lock; binding the device is the only exclusion.
+ *   NULL           - unbound (nvfanread's own driver lost the race or was
+ *                    unbound; nothing else is writing the page)
+ *   nvidia-ffa-ec  - the built-in driver on 7.0.0-1025+; it forwards ACPI FFH
+ *                    requests in registers and never uses the page
+ *   nvfanread      - our own claim driver (6.17 / 7.0.0-1019)
+ * Anything else (nvfancontrol, ec-probe's nvfanprobe) writes the page itself.
+ */
+#define NVFR_DRIVER_NAME            "nvfanread"
+#define NVFR_NVIDIA_EC_DRIVER_NAME  "nvidia-ffa-ec"
+
+static inline int nvfr_streq(const char *a, const char *b)
+{
+	while (*a && *a == *b) {
+		a++;
+		b++;
+	}
+	return *a == *b;
+}
+
+static inline int nvfr_owner_allowed(const char *driver_name)
+{
+	if (!driver_name)
+		return 1;
+	return nvfr_streq(driver_name, NVFR_NVIDIA_EC_DRIVER_NAME) ||
+	       nvfr_streq(driver_name, NVFR_DRIVER_NAME);
+}
+
+/*
+ * Reuse a result (success or failure) this young. Reading fan1 then fan2 then
+ * costs one EC transaction, and a reader loop on a failing EC cannot send more
+ * than one doorbell burst per period.
+ */
+#define NVFR_CACHE_US               200000LL
+
+static inline int nvfr_cache_fresh(int valid, long long age_us)
+{
+	return valid && age_us >= 0 && age_us < NVFR_CACHE_US;
 }
 
 #endif /* NVFANREAD_PROTO_H */

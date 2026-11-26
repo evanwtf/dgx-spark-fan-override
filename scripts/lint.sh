@@ -61,7 +61,9 @@ sh_files="nvfancontrol/DEBIAN/postinst \
 	scripts/lint.sh \
 	scripts/build-debs.sh \
 	scripts/build-nvfanread-deb.sh \
-	scripts/setup-signing.sh"
+	scripts/setup-signing.sh \
+	scripts/check-versions.sh \
+	scripts/test-check-versions.sh"
 
 if command -v shellcheck >/dev/null 2>&1; then
 	echo "== shellcheck =="
@@ -70,6 +72,13 @@ if command -v shellcheck >/dev/null 2>&1; then
 else
 	echo "== shellcheck not found; skipping shell lint (apt-get install shellcheck) =="
 fi
+
+# ---- Version pin: every nvfanread version declaration must agree ----------
+# Runs in CI with the lint job. The self-test proves the check fails on a
+# mismatch, so a broken check cannot pass silently.
+echo "== version pin =="
+sh scripts/check-versions.sh || status=1
+sh scripts/test-check-versions.sh || status=1
 
 if [ "$status" -eq 0 ]; then
 	echo "== lint OK =="
