@@ -10,11 +10,16 @@ provides two independent kernel modules:
 | [`nvfanread`](nvfanread/) | **read-only** | Read fan telemetry from the EC without changing anything; intended to surface fan RPM through hwmon / `sensors` / node_exporter. |
 
 Both talk to the same verified FF-A eSPI service (`arm-ffa-17`) through one
-shared page, which has no lock. Only one of them can use the mailbox at a time:
-whichever module binds `arm-ffa-17` first holds it, and the other cannot use
-the mailbox until it is unloaded. See
+shared page. Neither module needs to bind `arm-ffa-17`. Each request takes a
+mailbox lock on the shared page (the `nvfan-mailbox` iomem region), so the two
+modules can stay loaded together and take turns. See
 [`nvfanread/README.md`](nvfanread/README.md#one-mailbox-user-at-a-time) for how
 this works on each kernel.
+
+> **Install `nvfanread` and `nvfancontrol` from the same release.** Modules
+> from 1.0.0 do not take the mailbox lock. A 1.0.0 module next to a newer one
+> can write the shared page at the same time as the other.
+
 `nvfanread` is the read-only tool — see
 [`nvfanread/README.md`](nvfanread/README.md). Everything below documents the
 shared EC/FF-A protocol.
@@ -22,9 +27,11 @@ shared EC/FF-A protocol.
 > **Kernel 7.0.0-1025 and later.** The built-in `nvidia-ffa-ec` driver now
 > binds `arm-ffa-17` itself, and no other driver can take it over (see
 > [#15](https://github.com/evanwtf/dgx-spark-fan-override/issues/15)).
-> `nvfanread` 1.1.0 works with this: it uses the device without binding it.
-> `nvfancontrol` still binds as a driver, so on these kernels it loads but does
-> not attach, and cannot use the mailbox.
+> `nvfanread` 1.1.0 and the current `nvfancontrol` work with this: they use
+> the device without binding it (see
+> [#16](https://github.com/evanwtf/dgx-spark-fan-override/issues/16)).
+> `nvfancontrol` 1.0.0 binds as a driver, so on these kernels it loads but
+> does not attach, and cannot use the mailbox.
 
 ### Motivation: fan RPM in Prometheus
 
@@ -75,17 +82,47 @@ node_hwmon_fan_rpm * on(chip) group_left node_hwmon_chip_names{chip_name="nvfanr
   want the fans pinned at full speed permanently.
 - If you only want to *read* fan speed, use `nvfanread` and leave `nvfancontrol`
   uninstalled — the read path never writes an override slot.
+- **The `fan` attribute moved.** It is now
+  `/sys/devices/faux/nvfancontrol/fan` on every kernel. `nvfancontrol` 1.0.0
+  put it on the FF-A device (`/sys/bus/arm_ffa/devices/arm-ffa-17/fan`).
+  Update any script that writes the old path.
+- **Use matching versions.** Install `nvfanread` and `nvfancontrol` from the
+  same release. A 1.0.0 module does not take the mailbox lock, so it can write
+  the shared page while the other module uses it.
+- **A busy mailbox fails the write.** If `nvfanread` holds the mailbox lock for
+  more than 50 ms, a write to `fan` returns `EBUSY` and sends nothing to the
+  EC. The attribute then reads `error -16`. The EC keeps its previous override
+  value, so you can write again.
 
 ## `nvfancontrol` — override
 
-Once loaded, the module binds `arm-ffa-17` and creates:
+Once loaded, the module finds `arm-ffa-17` on the FF-A bus by UUID and holds a
+reference to it. It does not bind the device. It creates:
 
 ```text
-/sys/bus/arm_ffa/devices/arm-ffa-17/fan
+/sys/devices/faux/nvfancontrol/fan
 ```
 
 Writing `max` or `auto` sends one request each; reading the attribute returns
-`ready`, `max`, `auto`, or `error <errno>`.
+`ready`, `max`, `auto`, or `error <errno>`. Use `sudo nvfancontrol max`,
+`sudo nvfancontrol auto` or `sudo nvfancontrol status`; the helper loads the
+module when needed.
+
+Each request:
+
+1. Refuses if a driver that writes the shared page without the lock owns
+   `arm-ffa-17` (`nvfancontrol` 1.0.0 or the `ec-probe` tool). `nvidia-ffa-ec`
+   and `nvfanread` are allowed.
+2. Takes the `nvfan-mailbox` lock: `request_mem_region()` on the shared page
+   `0x933dd000`, size `0x1000`. If `nvfanread` holds it, the module tries again
+   for up to 50 ms, then returns `-EBUSY` and sends nothing.
+3. Snapshots the page, writes the frame, rings the doorbell (and retries a busy
+   doorbell for up to 10 ms), waits for the EC reply and restores the page.
+4. Releases the lock.
+
+The lock is held for one request only, so `nvfanread` and `nvfancontrol` can
+stay loaded together on every kernel. While a request runs, `/proc/iomem`
+shows `933dd000-933ddfff : nvfan-mailbox` under the `reserved` region.
 
 ```text
 Full fan speed:   07 05 00 BC 34    # 0x34BC = 13500 RPM

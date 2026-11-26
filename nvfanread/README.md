@@ -46,20 +46,32 @@ nvfanread: arm-ffa-17 (partition 0x8003) is bound to driver 'nvidia-ffa-ec'
 
 ## One mailbox user at a time
 
-The shared page has no lock. Binding `arm-ffa-17` is the only thing that stops
-`nvfanread`, `nvfancontrol` and the `ec-probe` tool from writing it at the same
-time.
+On 7.0.0-1025 and later neither `nvfanread` nor `nvfancontrol` can bind
+`arm-ffa-17`, so binding cannot keep them off the shared page at the same time.
+Both modules therefore take a mailbox lock for each request: they call
+`request_mem_region()` on the shared page (`0x933dd000`, size `0x1000`, name
+`nvfan-mailbox`). The kernel grants the region to one caller at a time. The
+lock covers the whole request: snapshot, frame write, doorbell, reply and
+restore. If the other module holds it, `nvfanread` tries again for up to 50 ms,
+then the read returns `-EBUSY`. Neither module holds the lock between requests,
+so both can stay loaded.
+
+Two other writers of the page do not take the lock: `nvfancontrol` 1.0.0 and
+the `ec-probe` tool. Both bind the device, so the binding still excludes them:
 
 - **6.17.0-1032 and 7.0.0-1019:** nothing else binds the device, so `nvfanread`
   binds it with a small claim driver, as 1.0.0 did. While it is loaded,
-  `nvfancontrol` and `ec-probe` cannot bind. If one of them bound first,
+  `nvfancontrol` 1.0.0 and `ec-probe` cannot bind. If one of them bound first,
   `nvfanread` still loads, but each read returns `-EBUSY` and logs a warning.
 - **7.0.0-1025 and later:** `nvidia-ffa-ec` holds the device, so neither
-  `nvfancontrol` nor `ec-probe` can bind, and `nvfanread` is the only mailbox
-  user.
+  `nvfancontrol` 1.0.0 nor `ec-probe` can bind.
 
 Before each read `nvfanread` checks who owns the device. It sends only when the
 device is unbound, or bound to `nvidia-ffa-ec` or to `nvfanread`.
+
+Install `nvfanread` and `nvfancontrol` from the same release. `nvfanread` 1.0.0
+does not take the lock, and it binds as `nvfanread`, so a newer `nvfancontrol`
+cannot tell it apart from the current claim driver.
 
 The secure partition also serves other EC services. It answers "busy" when
 another request is in flight, so `nvfanread` retries a busy send for up to
@@ -74,8 +86,9 @@ system.
 
 - **Read-only by construction.** The request builder can emit only command 7;
   there is no code path to an override write. This is asserted by a unit test.
-- Refuses a non-idle mailbox, snapshots the shared page, and restores it around
-  every request. Requests are serialized under a mutex.
+- Takes the mailbox lock, refuses a non-idle mailbox, snapshots the shared
+  page, and restores it around every request. Requests in the module are
+  serialized under a mutex.
 - Loading the module issues **no** EC request; a request happens only when the
   `telemetry` sysfs attribute is read.
 

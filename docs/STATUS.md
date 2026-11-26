@@ -31,7 +31,14 @@ changes with the kernel, because 7.0.0-1025 moved FF-A devices under
 
 The `telemetry` attribute moved to the hwmon device. The FF-A partition ID is
 `0x8003` (shared by all EC services); `17` is only the bus index.
-`nvfancontrol` still binds as a driver and does not attach on 7.0.0-1025+.
+
+`nvfancontrol` (#16) no longer binds either. It finds the device the same way
+and moves its `fan` attribute to `/sys/devices/faux/nvfancontrol/fan`. Because
+neither module binds on 7.0.0-1025+, both now take a mailbox lock for each
+request: `request_mem_region(0x933dd000, 0x1000, "nvfan-mailbox")`. The page
+sits in a top-level non-busy `reserved` iomem region, so the request nests
+under it, and a second request fails until the first is released. Install both
+modules from the same release; 1.0.0 modules do not take the lock.
 
 ## ✅ WORKING — fan RPM in `sensors` and node_exporter
 The goal is achieved end to end: **EC → hwmon → `sensors` → node_exporter →

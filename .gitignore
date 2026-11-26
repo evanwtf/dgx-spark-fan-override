@@ -15,3 +15,6 @@ MOK*
 mok*
 *_mok*
 signing_key*
+
+# Signed test builds of the modules (kept local, never committed).
+/signed/
