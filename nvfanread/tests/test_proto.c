@@ -303,35 +303,61 @@ static void test_cache_fresh(void)
 }
 
 /*
- * Mailbox lock retry: a busy region is tried again only inside both bounds.
- * Neither bound may be zero, or a module that holds the lock for a normal
+ * Mailbox lock retry: a busy region is tried again only before the deadline.
+ * The budget may not be zero, or a module that holds the lock for a normal
  * transaction would make every other request fail at once.
  */
 static void test_lock_retry_policy(void)
 {
-	/* Retries while both bounds hold. */
-	CHECK(nvfr_lock_should_retry(1, 0));
-	CHECK(nvfr_lock_should_retry(NVFR_LOCK_MAX_ATTEMPTS - 1,
-				     NVFR_LOCK_RETRY_BUDGET_US - 1));
+	CHECK(nvfr_lock_should_retry(0));
+	CHECK(nvfr_lock_should_retry(NVFR_LOCK_RETRY_BUDGET_US - 1));
 
-	/* The attempt bound stops it. */
-	CHECK(!nvfr_lock_should_retry(NVFR_LOCK_MAX_ATTEMPTS, 0));
-	CHECK(!nvfr_lock_should_retry(NVFR_LOCK_MAX_ATTEMPTS + 1, 0));
-
-	/* The time bound stops it. */
-	CHECK(!nvfr_lock_should_retry(1, NVFR_LOCK_RETRY_BUDGET_US));
-	CHECK(!nvfr_lock_should_retry(1, NVFR_LOCK_RETRY_BUDGET_US + 1));
+	/* The deadline stops it. */
+	CHECK(!nvfr_lock_should_retry(NVFR_LOCK_RETRY_BUDGET_US));
+	CHECK(!nvfr_lock_should_retry(NVFR_LOCK_RETRY_BUDGET_US + 1));
 
 	/* A clock that went back must not extend the wait. */
-	CHECK(!nvfr_lock_should_retry(1, -1));
+	CHECK(!nvfr_lock_should_retry(-1));
 
-	/* Bounded at 50 ms total; at least two tries. */
+	/* nvfanread waits 50 ms at most. */
 	CHECK_EQ(NVFR_LOCK_RETRY_BUDGET_US, 50000);
-	CHECK(NVFR_LOCK_MAX_ATTEMPTS >= 2);
-	CHECK(NVFR_LOCK_MAX_ATTEMPTS <= 100);
 
 	/* The name shows in /proc/iomem while a transaction runs. */
 	CHECK_EQ(strcmp(NVFR_MAILBOX_LOCK_NAME, "nvfan-mailbox"), 0);
+	CHECK_EQ(strcmp(NVFR_LOCK_MARKER_SYMBOL, "nvfanread_mailbox_lock_v1"), 0);
+}
+
+/*
+ * -EAGAIN means "nothing was sent" and nothing else. FF-A BUSY after all
+ * retries was not delivered; a transport -EAGAIN was maybe delivered.
+ */
+static void test_doorbell_errno(void)
+{
+	CHECK_EQ(nvfr_doorbell_errno(0), 0);
+	CHECK_EQ(nvfr_doorbell_errno(-EBUSY), -EAGAIN);
+	CHECK_EQ(nvfr_doorbell_errno(-EAGAIN), -EIO);
+
+	/* Everything else passes through unchanged, and is never -EAGAIN. */
+	CHECK_EQ(nvfr_doorbell_errno(-EIO), -EIO);
+	CHECK_EQ(nvfr_doorbell_errno(-EINVAL), -EINVAL);
+	CHECK_EQ(nvfr_doorbell_errno(-EOPNOTSUPP), -EOPNOTSUPP);
+	CHECK_EQ(nvfr_doorbell_errno(-EINTR), -EINTR);
+	CHECK_EQ(nvfr_doorbell_errno(-ECANCELED), -ECANCELED);
+	CHECK_EQ(nvfr_doorbell_errno(-ENODATA), -ENODATA);
+	CHECK_EQ(nvfr_doorbell_errno(-EACCES), -EACCES);
+	CHECK(nvfr_doorbell_errno(EBUSY) != -EAGAIN);   /* wrong sign */
+}
+
+/* A service status after delivery is never "nothing sent". */
+static void test_service_status_errno(void)
+{
+	unsigned int status;
+
+	CHECK_EQ(nvfr_service_status_errno(10), -EBUSY);
+	CHECK_EQ(nvfr_service_status_errno(5), -EIO);
+	CHECK_EQ(nvfr_service_status_errno(1), -EIO);
+	for (status = 1; status < 300; status++)
+		CHECK(nvfr_service_status_errno(status) != -EAGAIN);
 }
 
 int main(void)
@@ -349,6 +375,8 @@ int main(void)
 	test_owner_allowed();
 	test_cache_fresh();
 	test_lock_retry_policy();
+	test_doorbell_errno();
+	test_service_status_errno();
 
 	if (g_failures == 0) {
 		printf("ok - %d checks passed\n", g_checks);
