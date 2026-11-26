@@ -136,17 +136,27 @@ package. Under Secure Boot, first point DKMS's signing at a MOK you've enrolled
 # one-time: configure DKMS to sign with your enrolled MOK
 sudo scripts/setup-signing.sh ~/.mok/nvfanread-mok.priv ~/.mok/nvfanread-mok.der
 
-# build + install the package (needs dkms)
+# install the package (needs dkms): download nvfanread_<version>_arm64.deb
+# from https://github.com/evanwtf/dgx-spark-fan-override/releases
 sudo apt-get install -y dkms
-sh scripts/build-nvfanread-deb.sh
-sudo dpkg -i dist/nvfanread_1.1.0_arm64.deb
+sudo dpkg -i nvfanread_*_arm64.deb
+```
+
+To build the package from source instead, pass the version to stamp. Without
+one, the build uses the placeholder `0.0.0`:
+
+```sh
+export VERSION=1.1.0
+sh scripts/build-nvfanread-deb.sh "$VERSION"
+sudo dpkg -i "dist/nvfanread_${VERSION}_arm64.deb"
 ```
 
 The package registers the module with DKMS (built + signed on install and on
 every kernel update), drops `/lib/modules-load.d/nvfanread.conf` for boot
-auto-load, and installs `sensors` labels. Verify with `sensors nvfanread-*`. A
-prebuilt `.deb` is also attached to GitHub Releases (and to each `package` CI
-run's artifacts).
+auto-load, and installs `sensors` labels. Verify with `sensors nvfanread-*`. Every
+merge to `main` attaches the `.deb` to a GitHub Release (see the top-level
+README, "Releases"). Each `package` CI run also keeps a `0.0.0` test build for
+3 days.
 
 ## Usage (once loaded)
 

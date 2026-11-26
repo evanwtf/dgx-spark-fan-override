@@ -348,6 +348,30 @@ Service status:
 | `5` | Underlying status read, request write, or doorbell write failed; ~54 ms usually indicates a controller completion timeout |
 | `10` | EC mailbox status busy |
 
+## Releases
+
+Every merge to `main` publishes a
+[GitHub Release](https://github.com/evanwtf/dgx-spark-fan-override/releases)
+with both `.deb` packages (`nvfanread` and `nvfancontrol`) at one version.
+Download the `.deb` files from the Releases page.
+
+A label on the pull request sets the version bump:
+
+| Label | Effect |
+|---|---|
+| `semver:patch` | Patch bump (the default when no label is set) |
+| `semver:minor` | Minor bump |
+| `semver:major` | Major bump |
+| `skip-release` | The merge publishes nothing |
+
+A merge that changes only `docs/` or top-level `*.md` files publishes nothing.
+
+The workflow (`.github/workflows/release.yml`) owns the `v*` tags. Do not tag
+by hand. The tag is the only record of the version: the tree carries the
+placeholder `0.0.0`, and the build scripts stamp the release version into the
+package. The first automated release is 1.1.0. It continues from 1.0.0, the
+version built and deployed by hand before release automation.
+
 ## Credits
 
 This project builds directly on prior community reverse-engineering:
