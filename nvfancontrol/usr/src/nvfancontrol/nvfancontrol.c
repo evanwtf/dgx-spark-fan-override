@@ -2,19 +2,38 @@
 /*
  * DGX Spark DKMS-managed EC fan override / rollback sysfs driver
  *
- * Loading the module only binds the verified FF-A partition and creates:
+ * Loading the module finds the verified FF-A eSPI service (UUID
+ * 884a63a0-3285-4120-83aa-eec008a0a546, bus device arm-ffa-17) on the FF-A
+ * bus, holds a reference to it, and creates:
  *
- *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan
+ *   /sys/devices/faux/nvfancontrol/fan
  *
  * Writing "max" or "auto" issues one OEM1 command 17 request. Requests are
  * serialized, and the interface remains available for subsequent state changes.
+ *
+ * The module does not bind the FF-A device. On 7.0.0-1025+ the built-in
+ * nvidia-ffa-ec driver binds it, sets suppress_bind_attrs, and the FF-A bus
+ * has no driver_override, so no other driver can bind it (issue #16). The
+ * module sends through the device's ops without owning it, as nvfanread 1.1.0
+ * does.
+ *
+ * Because neither module binds on those kernels, binding no longer keeps
+ * nvfanread and nvfancontrol off the shared page at the same time. Each
+ * request therefore takes the page as a busy iomem region (MAILBOX_LOCK_NAME)
+ * for the whole transaction, and nvfanread does the same. The address, size
+ * and retry bounds must match nvfanread/nvfanread_proto.h.
  */
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/arm_ffa.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/errno.h>
+#include <linux/device/bus.h>
+#include <linux/device/faux.h>
 #include <linux/io.h>
+#include <linux/ioport.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/mm.h>
@@ -49,6 +68,32 @@
 #define REPLY_POLL_MS              10U
 #define ESPI_TIMEOUT_FLOOR_US      40000LL
 
+/*
+ * FF-A doorbell retry. The EC secure partition serves many services and
+ * answers -EBUSY while another request is in flight. Same bounds as
+ * NVFR_SEND_RETRY_BUDGET_US / NVFR_SEND_MAX_ATTEMPTS in nvfanread_proto.h.
+ */
+#define SEND_RETRY_BUDGET_US       10000LL
+#define SEND_MAX_ATTEMPTS          20U
+
+/*
+ * Cross-module mailbox lock. Same name and bounds as NVFR_MAILBOX_LOCK_NAME,
+ * NVFR_LOCK_RETRY_BUDGET_US and NVFR_LOCK_MAX_ATTEMPTS in nvfanread_proto.h.
+ */
+#define MAILBOX_LOCK_NAME          "nvfan-mailbox"
+#define LOCK_RETRY_BUDGET_US       50000LL
+#define LOCK_MAX_ATTEMPTS          50U
+
+/*
+ * Drivers that may own the FF-A device while this module uses the shared page:
+ * none, nvidia-ffa-ec (it never uses the page), or nvfanread (its claim
+ * driver on 6.17 / 7.0.0-1019; 1.1.0+ takes the mailbox lock). Any other owner
+ * (ec-probe's nvfanprobe, nvfancontrol 1.0.0) writes the page without the
+ * lock.
+ */
+#define NVIDIA_EC_DRIVER_NAME      "nvidia-ffa-ec"
+#define NVFANREAD_DRIVER_NAME      "nvfanread"
+
 enum nvfancontrol_fan_state {
 	NVFANCONTROL_READY = 0,
 	NVFANCONTROL_MAX,
@@ -56,12 +101,105 @@ enum nvfancontrol_fan_state {
 	NVFANCONTROL_ERROR,
 };
 
+/*
+ * Module-global state. The FF-A device belongs to another driver (or to none),
+ * so nothing is stored in its drvdata. The fan attribute lives on a faux
+ * device and reads this state directly.
+ */
 struct nvfancontrol_state {
-	struct ffa_device *fdev;
+	struct ffa_device *fdev;	/* reference held from bus_find_device() */
+	struct faux_device *faux;
 	struct mutex request_lock;
 	enum nvfancontrol_fan_state fan_state;
 	int last_error;
 };
+
+static struct nvfancontrol_state nvfancontrol_state = {
+	.request_lock = __MUTEX_INITIALIZER(nvfancontrol_state.request_lock),
+	.fan_state = NVFANCONTROL_READY,
+};
+
+static const uuid_t espi_uuid = UUID_INIT(0x884a63a0, 0x3285, 0x4120,
+					  0x83, 0xaa, 0xee, 0xc0,
+					  0x08, 0xa0, 0xa5, 0x46);
+
+/*
+ * Take the shared page as a busy iomem region for one transaction. nvfanread
+ * requests the same region, and the kernel grants it to one caller at a time.
+ * Retry a busy region for at most LOCK_RETRY_BUDGET_US, then return -EBUSY.
+ */
+static int mailbox_lock(struct device *dev)
+{
+	ktime_t start = ktime_get();
+	unsigned int attempts = 0;
+	s64 elapsed_us;
+
+	for (;;) {
+		if (request_mem_region(ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE,
+				       MAILBOX_LOCK_NAME))
+			return 0;
+		attempts++;
+		elapsed_us = ktime_us_delta(ktime_get(), start);
+		if (attempts >= LOCK_MAX_ATTEMPTS || elapsed_us < 0 ||
+		    elapsed_us >= LOCK_RETRY_BUDGET_US)
+			break;
+		usleep_range(1000, 2000);
+	}
+
+	dev_err(dev,
+		"mailbox lock %#llx busy after %u tries (%lld us); no EC request was sent\n",
+		ESPI_NS_SHM_PA, attempts, elapsed_us);
+	return -EBUSY;
+}
+
+static void mailbox_unlock(void)
+{
+	release_mem_region(ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE);
+}
+
+/* Refuse while a driver that writes the page without the lock owns the device. */
+static int check_owner(struct device *dev, struct ffa_device *fdev)
+{
+	const struct device_driver *owner = READ_ONCE(fdev->dev.driver);
+
+	if (!owner || !strcmp(owner->name, NVIDIA_EC_DRIVER_NAME) ||
+	    !strcmp(owner->name, NVFANREAD_DRIVER_NAME))
+		return 0;
+
+	dev_err(dev,
+		"%s is bound to '%s', which also uses the shared page; no EC request was sent\n",
+		dev_name(&fdev->dev), owner->name);
+	return -EBUSY;
+}
+
+/*
+ * Ring the doorbell (FF-A direct request 2, OEM1 command 17). Retry -EBUSY
+ * inside SEND_RETRY_BUDGET_US / SEND_MAX_ATTEMPTS; any other result returns
+ * at once.
+ */
+static int send_doorbell(struct ffa_device *fdev,
+			 struct ffa_send_direct_data2 *msg,
+			 s64 *elapsed_us, s64 *last_us, unsigned int *attempts)
+{
+	ktime_t start = ktime_get();
+	ktime_t attempt_start;
+	int ret;
+
+	*attempts = 0;
+	for (;;) {
+		memset(msg, 0, sizeof(*msg));
+		((u8 *)msg->data)[0] = ESPI_OEM_GENERIC_EMI;
+		attempt_start = ktime_get();
+		ret = fdev->ops->msg_ops->sync_send_receive2(fdev, msg);
+		(*attempts)++;
+		*last_us = ktime_us_delta(ktime_get(), attempt_start);
+		*elapsed_us = ktime_us_delta(ktime_get(), start);
+		if (ret != -EBUSY || *attempts >= SEND_MAX_ATTEMPTS ||
+		    *elapsed_us >= SEND_RETRY_BUDGET_US)
+			return ret;
+		usleep_range(500, 1000);
+	}
+}
 
 static void restore_shared_page(struct device *dev, u8 *shm,
 				const u8 snapshot[ESPI_NS_SHM_PROTOCOL_SIZE],
@@ -86,52 +224,62 @@ static void restore_shared_page(struct device *dev, u8 *shm,
 static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 {
 	struct ffa_device *fdev = state->fdev;
+	struct device *dev = &state->faux->dev;
 	struct ffa_send_direct_data2 msg = {};
 	u8 snapshot[ESPI_NS_SHM_PROTOCOL_SIZE];
 	u8 frame[ESPI_NS_SHM_PROTOCOL_SIZE] = {};
 	u8 request[GENERIC_FRAME_LENGTH];
 	u8 response[GENERIC_FRAME_LENGTH];
-	u8 *payload = (u8 *)msg.data;
 	u8 *shm;
 	unsigned long pfn = PHYS_PFN(ESPI_NS_SHM_PA);
 	unsigned long raw_response[4];
 	u32 service_status;
 	bool map_memory;
 	bool reserved_page = false;
+	unsigned int attempts;
 	unsigned int elapsed;
-	ktime_t start;
 	s64 elapsed_us;
+	s64 last_us;
 	int result;
 	int ret;
+
+	ret = check_owner(dev, fdev);
+	if (ret)
+		return ret;
 
 	map_memory = pfn_is_map_memory(pfn);
 	if (map_memory)
 		reserved_page = PageReserved(pfn_to_page(pfn));
 
-	dev_info(&fdev->dev,
+	dev_info(dev,
 		 "manifest ns_shm0: physical=%#llx size=%#x map_memory=%u page_reserved=%u\n",
 		 ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE,
 		 (unsigned int)map_memory, (unsigned int)reserved_page);
 
 	if (map_memory && !reserved_page) {
-		dev_err(&fdev->dev,
+		dev_err(dev,
 			"refusing ns_shm0: PFN is Linux map memory but is not marked reserved\n");
 		return -EPERM;
 	}
 
+	ret = mailbox_lock(dev);
+	if (ret)
+		return ret;
+
 	shm = memremap(ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE, MEMREMAP_WB);
 	if (!shm) {
-		dev_err(&fdev->dev, "memremap of manifest ns_shm0 failed\n");
-		return -ENOMEM;
+		dev_err(dev, "memremap of manifest ns_shm0 failed\n");
+		ret = -ENOMEM;
+		goto out_unlock;
 	}
 
 	memcpy(snapshot, shm, sizeof(snapshot));
-	dev_info(&fdev->dev, "shared pre-state: %*ph\n",
+	dev_info(dev, "shared pre-state: %*ph\n",
 		 (int)sizeof(snapshot), snapshot);
 
 	if (snapshot[GENERIC_INPUT_ACCEPTED] != 0 ||
 	    snapshot[GENERIC_OUTPUT_READY] != 0) {
-		dev_err(&fdev->dev,
+		dev_err(dev,
 			"refusing request: shared mailbox is not idle (accepted=%#04x ready=%#04x)\n",
 			snapshot[GENERIC_INPUT_ACCEPTED],
 			snapshot[GENERIC_OUTPUT_READY]);
@@ -153,23 +301,20 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 	mb();
 
 	if (target == TARGET_FULL_RPM)
-		dev_warn(&fdev->dev,
+		dev_warn(dev,
 			 "starting MAX request: fixed EC frame %*ph\n",
 			 (int)sizeof(request), request);
 	else
-		dev_warn(&fdev->dev,
+		dev_warn(dev,
 			 "starting AUTO request: fixed EC frame %*ph\n",
 			 (int)sizeof(request), request);
 
-	payload[0] = ESPI_OEM_GENERIC_EMI;
-	start = ktime_get();
-	ret = fdev->ops->msg_ops->sync_send_receive2(fdev, &msg);
-	elapsed_us = ktime_us_delta(ktime_get(), start);
+	ret = send_doorbell(fdev, &msg, &elapsed_us, &last_us, &attempts);
 	if (ret) {
-		dev_crit(&fdev->dev,
-			 "FF-A TRANSPORT FAILURE: ret=%d elapsed=%lld us; EC override state is unknown\n",
-			 ret, elapsed_us);
-		restore_shared_page(&fdev->dev, shm, snapshot, &ret);
+		dev_crit(dev,
+			 "FF-A TRANSPORT FAILURE: ret=%d attempts=%u elapsed=%lld us; EC override state is unknown\n",
+			 ret, attempts, elapsed_us);
+		restore_shared_page(dev, shm, snapshot, &ret);
 		goto out_unmap;
 	}
 
@@ -178,22 +323,23 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 	raw_response[2] = msg.data[2];
 	raw_response[3] = msg.data[3];
 	service_status = get_unaligned_le32((u8 *)msg.data);
-	dev_info(&fdev->dev,
-		 "command-17 response: status=%u elapsed=%lld us raw=%#018lx %#018lx %#018lx %#018lx\n",
-		 service_status, elapsed_us, raw_response[0], raw_response[1],
+	dev_info(dev,
+		 "command-17 response: status=%u attempts=%u elapsed=%lld us raw=%#018lx %#018lx %#018lx %#018lx\n",
+		 service_status, attempts, elapsed_us, raw_response[0], raw_response[1],
 		 raw_response[2], raw_response[3]);
 
 	if (service_status != 0) {
-		if (service_status == 5 && elapsed_us >= ESPI_TIMEOUT_FLOOR_US)
-			dev_crit(&fdev->dev,
+		/* Time only the final send; retries must not fake a timeout. */
+		if (service_status == 5 && last_us >= ESPI_TIMEOUT_FLOOR_US)
+			dev_crit(dev,
 				 "eSPI TIMEOUT: internal mailbox operation timed out; EC override state is unknown\n");
 		else
-			dev_crit(&fdev->dev,
+			dev_crit(dev,
 				 "SERVICE REJECTED: status=%u; EC override state is unknown\n",
 				 service_status);
 
 		ret = service_status == 10 ? -EBUSY : -EIO;
-		restore_shared_page(&fdev->dev, shm, snapshot, &ret);
+		restore_shared_page(dev, shm, snapshot, &ret);
 		goto out_unmap;
 	}
 
@@ -205,7 +351,7 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 	}
 
 	if (READ_ONCE(shm[GENERIC_OUTPUT_READY]) != 1) {
-		dev_crit(&fdev->dev,
+		dev_crit(dev,
 			 "OUTPUT TIMEOUT after %u ms: accepted=%#04x ready=%#04x; EC override state is unknown; shared frame is left intact and no retry is allowed\n",
 			 REPLY_TIMEOUT_MS,
 			 READ_ONCE(shm[GENERIC_INPUT_ACCEPTED]),
@@ -217,43 +363,45 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 	/* Order the ready-flag load ahead of reading the reply payload below. */
 	mb();
 	memcpy(response, &shm[GENERIC_DATA_OFFSET], sizeof(response));
-	dev_info(&fdev->dev,
+	dev_info(dev,
 		 "EC reply after <=%u ms: accepted=%#04x ready=%#04x response=%*ph\n",
 		 elapsed, READ_ONCE(shm[GENERIC_INPUT_ACCEPTED]),
 		 READ_ONCE(shm[GENERIC_OUTPUT_READY]),
 		 (int)sizeof(response), response);
 
 	if (memcmp(response, request, sizeof(response)) || response[2] != 0) {
-		dev_crit(&fdev->dev,
+		dev_crit(dev,
 			 "RESPONSE MISMATCH: expected=%*ph observed=%*ph; EC override state is unknown\n",
 			 (int)sizeof(request), request,
 			 (int)sizeof(response), response);
 		result = -EPROTO;
-		restore_shared_page(&fdev->dev, shm, snapshot, &result);
+		restore_shared_page(dev, shm, snapshot, &result);
 		ret = result;
 		goto out_unmap;
 	}
 
 	if (target == TARGET_FULL_RPM)
-		dev_warn(&fdev->dev,
+		dev_warn(dev,
 			 "MAX ACKNOWLEDGED: EC accepted high override=13500 RPM; fan0 and fan1 policy outputs saturate at 100%%\n");
 	else
-		dev_warn(&fdev->dev,
+		dev_warn(dev,
 			 "AUTO ACKNOWLEDGED: EC accepted high override=0xffff; automatic thermal curve is restored\n");
 
 	result = 0;
-	restore_shared_page(&fdev->dev, shm, snapshot, &result);
+	restore_shared_page(dev, shm, snapshot, &result);
 	ret = result;
 
 out_unmap:
 	memunmap(shm);
+out_unlock:
+	mailbox_unlock();
 	return ret;
 }
 
 static ssize_t fan_show(struct device *dev, struct device_attribute *attr,
 			char *buf)
 {
-	struct nvfancontrol_state *state = dev_get_drvdata(dev);
+	struct nvfancontrol_state *state = &nvfancontrol_state;
 	ssize_t length;
 
 	mutex_lock(&state->request_lock);
@@ -280,7 +428,7 @@ static ssize_t fan_show(struct device *dev, struct device_attribute *attr,
 static ssize_t fan_store(struct device *dev, struct device_attribute *attr,
 			 const char *buf, size_t count)
 {
-	struct nvfancontrol_state *state = dev_get_drvdata(dev);
+	struct nvfancontrol_state *state = &nvfancontrol_state;
 	enum nvfancontrol_fan_state requested_state;
 	u16 target;
 	int ret;
@@ -315,75 +463,92 @@ static ssize_t fan_store(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_RW(fan);
 
-static int fan_override_probe(struct ffa_device *fdev)
+/* Lives on the faux device, never on the FF-A device. */
+static struct attribute *nvfancontrol_attrs[] = {
+	&dev_attr_fan.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(nvfancontrol);
+
+static int nvfancontrol_match_espi(struct device *dev, const void *data)
 {
-	struct nvfancontrol_state *state;
+	return uuid_equal(&to_ffa_dev(dev)->uuid, &espi_uuid);
+}
+
+static int __init nvfancontrol_init(void)
+{
+	struct nvfancontrol_state *state = &nvfancontrol_state;
+	const struct device_driver *owner;
+	struct ffa_device *fdev;
+	struct faux_device *faux;
+	struct device *dev;
 	int ret;
+
+	dev = bus_find_device(&ffa_bus_type, NULL, NULL,
+			      nvfancontrol_match_espi);
+	if (!dev) {
+		pr_err("FF-A eSPI service %pUb not found on the arm_ffa bus\n",
+		       &espi_uuid);
+		return -ENODEV;
+	}
+	fdev = to_ffa_dev(dev);
 
 	if (!fdev->ops || !fdev->ops->msg_ops ||
 	    !fdev->ops->msg_ops->sync_send_receive2) {
-		dev_err(&fdev->dev, "FF-A Direct Request 2 is unavailable\n");
-		return -EOPNOTSUPP;
+		pr_err("%s: FF-A Direct Request 2 is unavailable\n",
+		       dev_name(dev));
+		ret = -EOPNOTSUPP;
+		goto err_put;
 	}
 
-	dev_info(&fdev->dev,
-		 "matched: partition=%#x uuid=%pUb properties=%#x mode_32bit=%u boot-age=%llu s\n",
-		 fdev->id, &fdev->uuid, fdev->properties,
-		 (unsigned int)fdev->mode_32bit,
-		 (unsigned long long)ktime_get_boottime_seconds());
+	owner = READ_ONCE(dev->driver);
+	pr_info("%s: found partition=%#x uuid=%pUb properties=%#x mode_32bit=%u driver='%s' boot-age=%llu s\n",
+		dev_name(dev), fdev->vm_id, &fdev->uuid, fdev->properties,
+		(unsigned int)fdev->mode_32bit, owner ? owner->name : "(none)",
+		(unsigned long long)ktime_get_boottime_seconds());
 
 	if (fdev->mode_32bit) {
-		dev_err(&fdev->dev,
-			"refusing Direct Request 2 for a 32-bit-mode device\n");
-		return -EOPNOTSUPP;
+		pr_err("%s: refusing Direct Request 2 for a 32-bit-mode device\n",
+		       dev_name(dev));
+		ret = -EOPNOTSUPP;
+		goto err_put;
 	}
-
-	state = devm_kzalloc(&fdev->dev, sizeof(*state), GFP_KERNEL);
-	if (!state)
-		return -ENOMEM;
 
 	state->fdev = fdev;
-	state->fan_state = NVFANCONTROL_READY;
-	mutex_init(&state->request_lock);
-	dev_set_drvdata(&fdev->dev, state);
 
-	ret = device_create_file(&fdev->dev, &dev_attr_fan);
-	if (ret) {
-		dev_err(&fdev->dev, "failed to create sysfs fan attribute: %d\n",
-			ret);
-		return ret;
+	faux = faux_device_create_with_groups(KBUILD_MODNAME, NULL, NULL,
+					      nvfancontrol_groups);
+	if (!faux) {
+		pr_err("failed to create the faux device for the fan attribute\n");
+		state->fdev = NULL;
+		ret = -ENOMEM;
+		goto err_put;
 	}
+	state->faux = faux;
 
-	dev_info(&fdev->dev,
-		 "sysfs control ready: %s/fan accepts 'max' or 'auto'; module load issued no EC request\n",
-		 dev_name(&fdev->dev));
+	pr_info("sysfs control ready: %s/fan accepts 'max' or 'auto'; module load issued no EC request\n",
+		dev_name(&faux->dev));
 	return 0;
+
+err_put:
+	put_device(dev);
+	return ret;
 }
 
-static void fan_override_remove(struct ffa_device *fdev)
+static void __exit nvfancontrol_exit(void)
 {
-	device_remove_file(&fdev->dev, &dev_attr_fan);
-	dev_warn(&fdev->dev,
-		 "module removed; unloading does NOT change the EC override value\n");
+	struct nvfancontrol_state *state = &nvfancontrol_state;
+
+	/* Destroy first: after this no fan_show/fan_store can reach state->fdev. */
+	faux_device_destroy(state->faux);
+	state->faux = NULL;
+	put_device(&state->fdev->dev);
+	state->fdev = NULL;
+	pr_warn("module removed; unloading does NOT change the EC override value\n");
 }
 
-static const struct ffa_device_id fan_override_ids[] = {
-	{
-		.uuid = UUID_INIT(0x884a63a0, 0x3285, 0x4120,
-				  0x83, 0xaa, 0xee, 0xc0,
-				  0x08, 0xa0, 0xa5, 0x46),
-	},
-	{},
-};
-
-static struct ffa_driver fan_override_driver = {
-	.name = "nvfancontrol",
-	.probe = fan_override_probe,
-	.remove = fan_override_remove,
-	.id_table = fan_override_ids,
-};
-
-module_ffa_driver(fan_override_driver);
+module_init(nvfancontrol_init);
+module_exit(nvfancontrol_exit);
 
 MODULE_DESCRIPTION("DGX Spark persistent EC fan sysfs controller");
 MODULE_AUTHOR("841973620");
