@@ -364,7 +364,13 @@ A label on the pull request sets the version bump:
 | `semver:major` | Major bump |
 | `skip-release` | The merge publishes nothing |
 
-A merge that changes only `docs/` or top-level `*.md` files publishes nothing.
+A merge publishes nothing when nothing since the last release changed outside
+`docs/` and `*.md` files. No `.md` file ships in either package.
+
+A direct push to `main` (not a pull request merge) publishes nothing. Its
+change ships with the next pull request merge, under that merge's label and
+notes. The release notes are the `## Quick summary` section of the pull
+request body, as it was at merge time.
 
 The workflow (`.github/workflows/release.yml`) owns the `v*` tags. Do not tag
 by hand. The tag is the only record of the version: the tree carries the

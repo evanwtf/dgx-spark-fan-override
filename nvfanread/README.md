@@ -142,11 +142,19 @@ sudo apt-get install -y dkms
 sudo dpkg -i nvfanread_*_arm64.deb
 ```
 
-To build the package from source instead, pass the version to stamp. Without
-one, the build uses the placeholder `0.0.0`:
+A local build of the current tree is a test build at the placeholder version
+`0.0.0`:
+
+```sh
+sh scripts/build-nvfanread-deb.sh
+```
+
+To reproduce a release, check out its tag first, then pass the same version.
+Never build a release version from any other commit:
 
 ```sh
 export VERSION=1.1.0
+git checkout "v$VERSION"
 sh scripts/build-nvfanread-deb.sh "$VERSION"
 sudo dpkg -i "dist/nvfanread_${VERSION}_arm64.deb"
 ```

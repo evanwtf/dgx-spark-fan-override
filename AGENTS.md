@@ -17,12 +17,15 @@ modules do and [docs/STATUS.md](docs/STATUS.md) for the current state.
   (`.github/workflows/release.yml`). Treat a merge as a release.
 - **Squash merge is the only merge method.** The workflow reads the PR number
   from the squash subject, `<title> (#N)`. Keep that suffix when you edit the
-  title at merge time, or the PR's labels are ignored.
+  title at merge time, or the release fails.
 - The PR label sets the bump: `semver:patch` (default), `semver:minor`,
-  `semver:major`, or `skip-release`. A docs-only merge (`docs/`, top-level
-  `*.md`) publishes nothing.
+  `semver:major`, or `skip-release`. A merge publishes nothing when nothing
+  since the last release changed outside `docs/` and `*.md` files.
+- A direct push to `main` publishes nothing. Its change ships with the next
+  PR merge, under that merge's label and notes.
 - Every PR body starts with `## Quick summary`. The release notes are that
-  section, so a PR without it fails the release.
+  section, so a PR without it fails the release. Do not edit the body after
+  the merge: the release refuses notes from a body edited after the merge.
 - Do not push `v*` tags. The workflow owns them.
 - Do not bump versions in the tree. Every version declaration is the
   placeholder `0.0.0`; the build scripts stamp the tag version into the
